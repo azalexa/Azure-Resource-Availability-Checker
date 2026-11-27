@@ -1,5 +1,13 @@
 # Changelog
 
+## 3.8 (includes 3.5–3.7)
+
+- 3.5: Add API Management, Azure OpenAI and Azure AI Services account SKU checks; add Cognitive Services and Container Apps regional quota reports; multiple SKU requests and explicit quota demand.
+- 3.6: Check logical zone support for Compute and API Management SKU metadata.
+- 3.7: Screen caller management-plane grants at resource group scope.
+- 3.8: Check name availability for five services, with optional CSV and JSON output.
+- Add regression tests and maintain the existing workflow. No claims of full deployment validation.
+
 ## 3.4
 
 - Add explicit automation inputs and JSON configuration without menu prompts.

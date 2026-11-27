@@ -1,0 +1,33 @@
+{
+  "Subscription": "Your subscription",
+  "Regions": [
+    "westeurope"
+  ],
+  "Resources": [
+    "Microsoft.Storage/storageAccounts",
+    "Microsoft.Compute/virtualMachines"
+  ],
+  "SkuRequests": [
+    "Storage Account|Standard_LRS",
+    "Virtual Machine|Standard_D2s_v5"
+  ],
+  "ZoneRequests": [
+    "Virtual Machine|Standard_D2s_v5|1"
+  ],
+  "CheckQuota": true,
+  "QuotaProviders": [
+    "Compute"
+  ],
+  "QuotaDemand": [
+    "Compute|Total Regional vCPUs|2"
+  ],
+  "RbacGroup": "existing-rg",
+  "RbacActions": [
+    "Microsoft.Storage/storageAccounts/write"
+  ],
+  "NameRequests": [
+    "Storage Account|examplecheck12345"
+  ],
+  "FailOnWarning": false,
+  "OutputJson": "azure-preflight-report.json"
+}

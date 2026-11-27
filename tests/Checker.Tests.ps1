@@ -256,3 +256,77 @@ Describe 'Automation configuration and gate decisions' {
         Should -Invoke Read-Host -Times 0 -Exactly
     }
 }
+
+Describe 'Extended preflight checks v3.8' {
+    It 'distinguishes zone catalog entries and an absent zone' {
+        $sku = [pscustomobject]@{locations=@('westeurope');locationInfo=@([pscustomobject]@{location='westeurope';zones=@('1','2')});restrictions=@()}
+        Get-ZoneStatus $sku $region '1' | Should -Be 'LISTED'
+        Get-ZoneStatus $sku $region '3' | Should -Be 'NOT_LISTED'
+    }
+    It 'handles a restriction in the specified zone only' {
+        $sku = [pscustomobject]@{locations=@('westeurope');locationInfo=@([pscustomobject]@{location='westeurope';zones=@('1','2')});restrictions=@([pscustomobject]@{type='Zone';restrictionInfo=[pscustomobject]@{locations=@('westeurope');zones=@('2')}})}
+        Get-ZoneStatus $sku $region '1' | Should -Be 'LISTED'
+        Get-ZoneStatus $sku $region '2' | Should -Be 'RESTRICTED'
+    }
+    It 'keeps missing zone metadata unknown' {
+        Get-ZoneStatus ([pscustomobject]@{locations=@('westeurope')}) $region '1' | Should -Be 'UNKNOWN'
+    }
+    It 'applies NotActions only to its own grant' {
+        $permission = [pscustomobject]@{actions=@('Microsoft.Storage/*');notActions=@('Microsoft.Storage/storageAccounts/write')}
+        Test-ArmActionGrant @($permission) 'Microsoft.Storage/storageAccounts/write' | Should -BeFalse
+        Test-ArmActionGrant @($permission) 'Microsoft.Storage/storageAccounts/read' | Should -BeTrue
+        $second = [pscustomobject]@{actions=@('Microsoft.Storage/storageAccounts/write');notActions=@()}
+        Test-ArmActionGrant @($permission,$second) 'Microsoft.Storage/storageAccounts/write' | Should -BeTrue
+    }
+    It 'does not confuse data-plane grants with ARM actions' {
+        Test-ArmActionGrant @([pscustomobject]@{actions=@();dataActions=@('*')}) 'Microsoft.Storage/storageAccounts/write' | Should -BeFalse
+    }
+    It 'interprets positive and negative name responses without assuming missing values' {
+        Get-NameCheckStatus ([pscustomobject]@{nameAvailable=$true}) | Should -Be 'AVAILABLE'
+        Get-NameCheckStatus ([pscustomobject]@{nameAvailable=$false}) | Should -Be 'UNAVAILABLE'
+        Get-NameCheckStatus ([pscustomobject]@{nameAvailable='false'}) | Should -Be 'UNKNOWN'
+        Get-NameCheckStatus $false -ExistsResponse | Should -Be 'NOT_FOUND'
+        Get-NameCheckStatus $true -ExistsResponse | Should -Be 'UNAVAILABLE'
+    }
+    It 'reports name query failures as errors' {
+        Mock Assert-Subscription {}
+        Mock Invoke-AzJson { throw 'Fake name API failure' }
+        Mock Show-CheckTable {}
+        $rows = @(Invoke-NameCheck -SubId $sub -Requests @('Storage Account|examplename'))
+        $rows[0].Status | Should -Be 'ERROR'
+    }
+    It 'compares exact quota demands and preserves missing data as unknown' {
+        $quota = @([pscustomobject]@{Region='West Europe';Service='Compute (vCPU)';Quota='Total Regional vCPUs';Remaining=8;Unit='Count';Status='HEADROOM'})
+        $a = @(Get-QuotaDemandRows -Quota $quota -Regions @($region) -Requests @('Compute|Total Regional vCPUs|8') -SubId $sub)
+        $a[0].Status | Should -Be 'FITS'
+        $b = @(Get-QuotaDemandRows -Quota $quota -Regions @($region) -Requests @('Compute|Total Regional vCPUs|9','Compute|missing|1') -SubId $sub)
+        $b[0].Status | Should -Be 'INSUFFICIENT'
+        $b[1].Status | Should -Be 'UNKNOWN'
+    }
+    It 'rejects duplicate quota demand rather than comparing each independently' {
+        { Get-QuotaDemandRows -Quota @() -Regions @($region) -Requests @('Compute|vCPU|1','Compute|vCPU|2') -SubId $sub } | Should -Throw '*Duplicate*'
+    }
+    It 'maps extra results to conservative gate findings' {
+        (Get-ExtendedFindings names @([pscustomobject]@{Status='UNAVAILABLE'})).Severity | Should -Be 'BLOCK'
+        (Get-ExtendedFindings rbac @([pscustomobject]@{Status='GRANT_NOT_LISTED'})).Severity | Should -Be 'ERROR'
+        (Get-ExtendedFindings rbac @([pscustomobject]@{Status='GRANT_LISTED'})).Severity | Should -Be 'WARNING'
+        @(Get-ExtendedFindings demand @([pscustomobject]@{Status='FITS'})).Count | Should -Be 0
+    }
+    It 'supports multiple SKU requests while rejecting conflicting legacy options' {
+        $opts = @{Subscription='Example';Regions=@('westeurope');Resources=@('Microsoft.Storage/storageAccounts');SkuRequests=@('Storage Account|Standard_LRS','API Management|Developer')}
+        (Get-CheckerOptions -Bound $opts).SkuRequests.Count | Should -Be 2
+        { Get-CheckerOptions -Bound ($opts + @{SkuService='Storage Account';SkuName='Standard_LRS'}) } | Should -Throw '*not both*'
+    }
+    It 'reads the API Management SKU catalog using its subscription API' {
+        Mock Get-ArmList { [pscustomobject]@{name='Developer';tier='Developer';locations=@('West Europe');restrictions=@()} }
+        $rows = @(Get-ExtendedSkuRows -Region $region -Service 'API Management' -SubId $sub)
+        $rows[0].Status | Should -Be 'LISTED'
+        Should -Invoke Get-ArmList -Times 1 -Exactly -ParameterFilter { $Url -like '*/Microsoft.ApiManagement/skus?api-version=2024-05-01' }
+    }
+    It 'parses AI account SKU metadata without making model claims' {
+        Mock Invoke-AzJson { [pscustomobject]@{sku=[pscustomobject]@{name='S0';tier='Standard'}} }
+        $rows = @(Get-ExtendedSkuRows -Region $region -Service 'Azure OpenAI' -SubId $sub)
+        $rows[0].SKU | Should -Be 'S0'
+        $rows[0].Status | Should -Be 'LISTED'
+    }
+}
