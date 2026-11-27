@@ -82,6 +82,7 @@ Describe 'Quota boundaries with mocked CLI responses' {
         Mock Select-AzureRegions { [pscustomobject]@{Name='westeurope';DisplayName='West Europe'} }
         Mock Select-Menu { [pscustomobject]@{Name='Compute';Command=@('vm','list-usage')} }
         Mock Assert-Subscription {}
+        Mock Get-ProviderCheckStatus { [pscustomobject]@{Status='REGISTERED';Detail='Mock provider registered.'} }
         Mock Show-CheckTable {}
     }
     It 'handles limits, missing usage and zero limit' {
@@ -158,7 +159,10 @@ echo {"ok":true}
 exit /b 0
 '@ | Set-Content -LiteralPath $fakeCli -Encoding ASCII
             $fakeError = Join-Path $TestDrive 'fake-fail.cmd'
-            '@exit /b 9' | Set-Content -LiteralPath $fakeError -Encoding ASCII
+            @'
+@echo FakeProviderError 1>&2
+@exit /b 9
+'@ | Set-Content -LiteralPath $fakeError -Encoding ASCII
             $fakeInvalid = Join-Path $TestDrive 'fake-invalid.cmd'
             '@echo not-json' | Set-Content -LiteralPath $fakeInvalid -Encoding ASCII
         } else {
@@ -166,7 +170,7 @@ exit /b 0
             $fakeError = Join-Path $TestDrive 'fake-fail'
             $fakeInvalid = Join-Path $TestDrive 'fake-invalid'
             [IO.File]::WriteAllText($fakeCli, '#!/bin/sh' + "`n" + '[ "$5" = "atScope()" ] && [ "$6" = "--expand" ] || exit 7' + "`n" + 'printf ''%s\n'' ''{"ok":true}''' + "`n")
-            [IO.File]::WriteAllText($fakeError, "#!/bin/sh`nexit 9`n")
+            [IO.File]::WriteAllText($fakeError, "#!/bin/sh`necho FakeProviderError 1>&2`nexit 9`n")
             [IO.File]::WriteAllText($fakeInvalid, "#!/bin/sh`necho not-json`n")
             & chmod +x $fakeCli $fakeError $fakeInvalid
             if ($LASTEXITCODE -ne 0) { throw 'Cannot prepare fake CLI.' }
@@ -177,6 +181,9 @@ exit /b 0
     }
     It 'throws for nonzero CLI exit codes' {
         { Invoke-AzJson -Arguments $fakeArgs -CliPath $fakeError } | Should -Throw '*Azure CLI command failed*'
+    }
+    It 'includes native stderr in the failure diagnostic' {
+        { Invoke-AzJson -Arguments $fakeArgs -CliPath $fakeError } | Should -Throw '*FakeProviderError*'
     }
     It 'throws for invalid JSON' {
         { Invoke-AzJson -Arguments $fakeArgs -CliPath $fakeInvalid } | Should -Throw
@@ -328,5 +335,147 @@ Describe 'Extended preflight checks v3.8' {
         $rows = @(Get-ExtendedSkuRows -Region $region -Service 'Azure OpenAI' -SubId $sub)
         $rows[0].SKU | Should -Be 'S0'
         $rows[0].Status | Should -Be 'LISTED'
+    }
+}
+
+
+Describe 'v3.8.1 live-test regressions' {
+    BeforeEach {
+        Mock Assert-Subscription {}
+        Mock Show-CheckTable {}
+        Mock Read-Host { throw 'Unexpected prompt' }
+    }
+    It 'resolves subscription IDs before ambiguous account names' {
+        $accounts = @([pscustomobject]@{Id='id1';AccountName='Same'},[pscustomobject]@{Id='id2';AccountName='Same'})
+        (Resolve-SubscriptionSelection $accounts 'id2').Id | Should -Be 'id2'
+        { Resolve-SubscriptionSelection $accounts 'Same' } | Should -Throw '*Multiple subscriptions*'
+        { Resolve-SubscriptionSelection $accounts 'missing' } | Should -Throw '*Subscription not found*'
+    }
+    It 'rejects invalid App Service SKU values, including the all-menu number' {
+        Test-AppServiceSku '0' | Should -BeFalse
+        Test-AppServiceSku 'B99' | Should -BeFalse
+        Test-AppServiceSku 'B1' | Should -BeTrue
+        Test-AppServiceSku 'P1v4' | Should -BeTrue
+        Test-AppServiceSku 'P5MV3' | Should -BeTrue
+        $opts = @{Subscription='Example';Regions=@('westeurope');Resources=@('Microsoft.Web/serverfarms');SkuService='App Service Plan';SkuName='0'}
+        { Get-CheckerOptions -Bound $opts } | Should -Throw '*Invalid App Service SKU*'
+    }
+    It 'skips App Service interactively when the SKU prompt is blank' {
+        Mock Select-Menu { [pscustomobject]@{Name='App Service Plan'} }
+        Mock Read-Host { '' }
+        Mock Invoke-AzJson { throw 'Unexpected Azure query' }
+        @(Invoke-SkuCheck -SubId $sub -SelectedRegions @($region)).Count | Should -Be 0
+        Should -Invoke Invoke-AzJson -Times 0 -Exactly
+    }
+    It 'classifies SQL availability using explicit booleans rather than catalog presence' {
+        Get-SqlSkuStatus ([pscustomobject]@{available=$false}) 'S0' | Should -Be 'UNAVAILABLE'
+        Get-SqlSkuStatus ([pscustomobject]@{available=$true}) 'S0' | Should -Be 'LISTED'
+        Get-SqlSkuStatus ([pscustomobject]@{available='False'}) 'S0' | Should -Be 'UNKNOWN'
+        Get-SqlSkuStatus ([pscustomobject]@{}) 'S0' | Should -Be 'UNKNOWN'
+    }
+    It 'queries unfiltered SQL editions and retains negative availability' {
+        Mock Get-ProviderCheckStatus { [pscustomobject]@{Status='REGISTERED';Detail='Mock'} }
+        Mock Invoke-AzJson {
+            [pscustomobject]@{serviceObjective='S0';edition='Standard';available=$false}
+        }
+        $rows = @(Invoke-SkuCheck -SubId $sub -SelectedRegions @($region) -RequestedService 'SQL Database' -RequestedSku 'S0')
+        $rows.Count | Should -Be 1
+        $rows[0].Status | Should -Be 'UNAVAILABLE'
+        Should -Invoke Invoke-AzJson -Times 1 -Exactly -ParameterFilter { $Arguments -contains 'list-editions' -and $Arguments -notcontains '--available' }
+    }
+    It 'distinguishes registration state from a failed registration query' {
+        Mock Invoke-AzJson { [pscustomobject]@{registrationState='NotRegistered'} }
+        (Get-ProviderCheckStatus 'Microsoft.Network' $sub).Status | Should -Be 'NOT_REGISTERED'
+        Mock Invoke-AzJson { throw 'Access denied' }
+        (Get-ProviderCheckStatus 'Microsoft.Network' $sub).Status | Should -Be 'REGISTRATION_UNKNOWN'
+    }
+    It 'skips the quota API when a provider is not registered' {
+        Mock Invoke-AzJson { [pscustomobject]@{registrationState='NotRegistered'} }
+        $rows = @(Invoke-QuotaCheck -SubId $sub -SelectedRegions @($region) -RequestedProviders Network)
+        $rows.Count | Should -Be 1
+        $rows[0].Status | Should -Be 'NOT_REGISTERED'
+        $rows[0].Detail | Should -Match 'Microsoft.Network'
+        Should -Invoke Invoke-AzJson -Times 0 -Exactly -ParameterFilter { $Arguments -contains 'list-usages' }
+    }
+    It 'keeps remaining SQL entitlement counters out of consumable quota calculations' {
+        Mock Get-ProviderCheckStatus { [pscustomobject]@{Status='REGISTERED';Detail='Mock'} }
+        Mock Invoke-AzJson { [pscustomobject]@{name=[pscustomobject]@{localizedValue='SubscriptionFreeDatabaseDaysLeft'};currentValue=365;limit=365;unit='Count'} }
+        $rows = @(Invoke-QuotaCheck -SubId $sub -SelectedRegions @($region) -RequestedProviders SQL)
+        $rows[0].Status | Should -Be 'INFORMATIONAL'
+        $rows[0].Used | Should -Be 365
+        $rows[0].Remaining | Should -BeNullOrEmpty
+        (Get-QuotaDemandRows -Quota $rows -Regions @($region) -Requests @('SQL|SubscriptionFreeDatabaseDaysLeft|1') -SubId $sub).Status | Should -Be 'UNKNOWN'
+    }
+    It 'does not prompt for demand when usable quota data is absent' {
+        Mock Select-Menu { throw 'Unexpected menu' }
+        $rows = @([pscustomobject]@{Status='ERROR';Quota='';Remaining=$null},[pscustomobject]@{Status='INFORMATIONAL';Quota='DaysLeft';Remaining=$null})
+        Select-QuotaDemandRequest $rows | Should -BeNullOrEmpty
+        Should -Invoke Read-Host -Times 0 -Exactly
+        Should -Invoke Select-Menu -Times 0 -Exactly
+    }
+    It 'builds the demand request from selected quota metadata' {
+        Mock Select-Menu { [pscustomobject]@{Name='Storage | Storage Accounts';Provider='Storage';Quota='Storage Accounts'} }
+        Mock Read-Host { '2' }
+        $rows = @([pscustomobject]@{Status='HEADROOM';Service='Storage (account counts)';Quota='Storage Accounts';Remaining=250})
+        Select-QuotaDemandRequest $rows | Should -Be 'Storage|Storage Accounts|2'
+    }
+    It 'maps unavailable SKUs and unregistered providers to blocking findings' {
+        $ok = @([pscustomobject]@{Status='SUPPORTED';Registration='Registered'})
+        (Get-PreflightDecision -Availability $ok -Sku @([pscustomobject]@{Status='UNAVAILABLE'}) -ExpectSku).ExitCode | Should -Be 1
+        (Get-PreflightDecision -Availability $ok -Quota @([pscustomobject]@{Status='NOT_REGISTERED'}) -ExpectQuota).ExitCode | Should -Be 1
+        (Get-PreflightDecision -Availability $ok -Quota @([pscustomobject]@{Status='REGISTRATION_UNKNOWN'}) -ExpectQuota).ExitCode | Should -Be 2
+        (Get-PreflightDecision -Availability $ok -Quota @([pscustomobject]@{Status='INFORMATIONAL'}) -ExpectQuota -Strict).ExitCode | Should -Be 0
+    }
+}
+
+
+Describe 'SQL nested capability regression' {
+    BeforeEach {
+        Mock Assert-Subscription {}
+        Mock Show-CheckTable {}
+        Mock Get-ProviderCheckStatus { [pscustomobject]@{Status='REGISTERED';Detail='Mock'} }
+    }
+    It 'expands real-shaped nested service objectives and preserves restriction reasons' {
+        Mock Invoke-AzJson {
+            [pscustomobject]@{name='Standard';status='Visible';reason='Provisioning is restricted in this region.';supportedServiceLevelObjectives=@(
+                [pscustomobject]@{name='S0';status='Visible';reason='Provisioning is restricted in this region.';sku=[pscustomobject]@{name='Standard';tier='Standard';capacity=10}},
+                [pscustomobject]@{name='S1';status='Visible';sku=[pscustomobject]@{name='Standard';tier='Standard';capacity=20}}
+            )}
+        }
+        $rows = @(Invoke-SkuCheck -SubId $sub -SelectedRegions @($region) -RequestedService 'SQL Database' -RequestedSku 'S0')
+        $rows.Count | Should -Be 1
+        $rows[0].SKU | Should -Be 'S0'
+        $rows[0].Tier | Should -Be 'Standard'
+        $rows[0].Status | Should -Be 'UNAVAILABLE'
+        $rows[0].Detail | Should -Match 'Provisioning is restricted'
+        $ok = @([pscustomobject]@{Status='SUPPORTED';Registration='Registered'})
+        (Get-PreflightDecision -Availability $ok -Sku $rows -ExpectSku).ExitCode | Should -Be 1
+    }
+    It 'preserves capacity-specific objective names and positive and negative capability states' {
+        $edition = [pscustomobject]@{name='GeneralPurpose';status='Available';supportedServiceLevelObjectives=@(
+            [pscustomobject]@{name='GP_Gen5_2';status='Available';sku=[pscustomobject]@{name='GP_Gen5';tier='GeneralPurpose'}},
+            [pscustomobject]@{name='GP_Gen5_4';status='Default'},
+            [pscustomobject]@{name='GP_Gen5_8';status='Disabled'},
+            [pscustomobject]@{name='GP_Gen5_16';status='FutureStatus'},
+            [pscustomobject]@{name='GP_Gen5_32'}
+        )}
+        $rows = @(Get-SqlSkuRows -Data @($edition) -Region $region -SubId $sub)
+        $rows.Count | Should -Be 5
+        $rows[0].SKU | Should -Be 'GP_Gen5_2'
+        $rows[0].Status | Should -Be 'LISTED'
+        $rows[1].Status | Should -Be 'LISTED'
+        $rows[2].Status | Should -Be 'UNAVAILABLE'
+        $rows[3].Status | Should -Be 'UNKNOWN'
+        $rows[4].Status | Should -Be 'UNKNOWN'
+    }
+    It 'does not mark a child available when its parent edition is restricted' {
+        Get-SqlSkuStatus ([pscustomobject]@{status='Available'}) 'S0' ([pscustomobject]@{status='Visible'}) | Should -Be 'UNAVAILABLE'
+        Get-SqlSkuStatus ([pscustomobject]@{status='Available'}) 'S0' ([pscustomobject]@{status='FutureStatus'}) | Should -Be 'UNKNOWN'
+    }
+    It 'does not report an edition name as a SKU when objectives are missing' {
+        $rows = @(Get-SqlSkuRows -Data @([pscustomobject]@{name='Standard';status='Available';supportedServiceLevelObjectives=@()}) -Region $region -SubId $sub)
+        $rows.Count | Should -Be 1
+        $rows[0].SKU | Should -Be '(unparsed)'
+        $rows[0].Status | Should -Be 'UNKNOWN'
     }
 }

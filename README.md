@@ -2,7 +2,7 @@
 
 An interactive PowerShell utility that checks Azure Resource Manager resource type availability across Azure regions before infrastructure deployment. It uses Azure CLI metadata from the selected subscription and does not provision or modify Azure resources.
 
-**Current version: 3.8**
+**Current version: 3.8.1**
 
 [![CI](https://github.com/azalexa/Azure-Resource-Availability-Checker/actions/workflows/ci.yml/badge.svg)](https://github.com/azalexa/Azure-Resource-Availability-Checker/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/azalexa/Azure-Resource-Availability-Checker)](https://github.com/azalexa/Azure-Resource-Availability-Checker/releases) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
@@ -46,12 +46,10 @@ Unblock-File .\Azure-Resource-Availability-Checker.ps1
 
 ## Usage
 
-1. Choose an Azure subscription.
-2. Choose one or more geography groups.
-3. Choose one or more Azure regions. Enter `0` to select all listed choices.
-4. Press Enter to check all returned Azure resource types, or choose a narrower report scope.
-5. Review the regional availability tables and region comparison.
-6. Press Enter or `N` to run another check, `K` for SKU, `U` for quota, `P` for Azure Policy, `Z` for zones, `R` for RBAC, `A` for names, `D` for quota demand, `E` to export the last successful report, or `Q` to quit.
+1. Choose an enabled Azure subscription. The main menu opens immediately.
+2. Press Enter or `N` for regional availability, `K` for SKU, `U` for quota, `P` for policy, `Z` for zones, `R` for RBAC, `A` for names, or `D` for quota demand.
+3. For regional availability, choose geography groups, regions and report scope. Enter `0` to select all choices in multi-select menus.
+4. Review the report. Use `E` to export the last usable report, `S` to switch subscriptions, or `Q` to quit. Switching subscriptions clears the in-memory report to avoid mixing subscription data; previously saved files are not deleted. The original Azure CLI subscription is restored on exit if the checker changed it.
 
 ### Report scope
 
@@ -86,20 +84,22 @@ NOT_SUPPORTED   Example resource type          NotRegistered
 
 ## SKU availability (K)
 
-Choose regions and one or more services. Use the optional substring filter to narrow results. For App Service, enter one plan SKU (e.g. B1 or P1V3) and whether to filter for Linux workers.
+Choose regions and one or more services. Use the optional substring filter to narrow results. For App Service, enter one supported plan SKU (e.g. B1 or P1V3) and whether to filter for Linux workers. Press Enter at the SKU prompt to skip App Service. The local allowlist follows the Azure CLI values observed in live testing; future CLI versions may introduce new values.
 
 | Service | Metadata source |
 | --- | --- |
 | Virtual Machine / Managed Disk | `az vm list-skus --all` (resource type filter) |
 | Storage Account | Azure Resource Manager Storage SKUs API (GET) |
 | App Service Plan | `az appservice list-locations --sku` |
-| SQL Database | `az sql db list-editions --available` |
+| SQL Database | `az sql db list-editions` (unfiltered) |
 | PostgreSQL Flexible Server | `az postgres flexible-server list-skus` |
 | MySQL Flexible Server | `az mysql flexible-server list-skus` |
 | API Management | ARM subscription SKU list (2024-05-01) |
 | Azure OpenAI / Azure AI Services | `az cognitiveservices account list-skus --kind --location` (account tiers only, not model deployments) |
 
-`LISTED` means catalog evidence was returned, not a deployment guarantee. `RESTRICTED` means an applicable restriction was detected; `ZONE_RESTRICTED` flags a zone restriction (inspect details). `RESTRICTION_UNKNOWN` means restrictions cannot be safely interpreted. `NOT_LISTED` means a region is absent from the returned list. `UNKNOWN` means metadata is missing or could not be parsed; `NO_DATA` means no matching records returned. `ERROR` means the request failed. Raw details are included in the optional CSV. An API/CLI failure is never treated as proof that a SKU is unavailable. SKU checks are limited to the services above, not all ARM providers.
+`LISTED` means catalog evidence was returned, not a deployment guarantee. `RESTRICTED` means an applicable restriction was detected; `ZONE_RESTRICTED` flags a zone restriction (inspect details). `RESTRICTION_UNKNOWN` means restrictions cannot be safely interpreted. `NOT_LISTED` means a region is absent from the returned list. `UNKNOWN` means metadata is missing or could not be parsed; `NO_DATA` means no matching records returned. `ERROR` means the request failed. Raw details are included in the optional CSV. For SQL Database, nested `supportedServiceLevelObjectives` are expanded using the capacity-specific objective name. `Available` and `Default` indicate catalog availability; `Visible`, `Disabled` or explicit `available: false` at objective or edition level are `UNAVAILABLE`. Unknown or missing capability metadata remains `UNKNOWN` unless another explicit field establishes availability. Edition and objective reasons are retained in raw details. An API/CLI failure is never treated as proof that a SKU is unavailable. SKU checks are limited to the services above, not all ARM providers.
+
+Before SKU and quota queries, the checker reads provider registration state once per provider per report. `NOT_REGISTERED` means registration is explicitly absent, `REGISTERING` means registration is in progress, and `REGISTRATION_UNKNOWN` covers unconfirmed states or failed registration queries. These statuses skip the affected SKU/usage query; they do not establish regional or SKU unavailability. The separate resource and zone checks can still return catalog metadata. No provider is automatically registered. Diagnostic messages are shown below the report.
 
 ## Quota and usage (U)
 
@@ -114,7 +114,7 @@ Choose one or more regions and quota providers. The report includes used, limit,
 | CognitiveServices | `az cognitiveservices usage list --location` |
 | ContainerApps | `az containerapp list-usages --location` (CLI version/extension may be required; regional quotas only) |
 
-`HEADROOM` means usage is below 80% of a positive limit; `NEAR_LIMIT` means 80% or more but below the limit; `EXHAUSTED` means used is at least the limit (including a zero limit). Negative, missing or unparseable usage/limit values are `UNKNOWN`. Remaining is clamped at zero. A deployment may require more capacity than the reported headroom; VM family and total regional vCPU quotas both matter. These are provider-specific usage metrics, not a complete quota inventory. Some subscriptions may lack permissions or expose no usage metrics.
+`HEADROOM` means usage is below 80% of a positive limit; `NEAR_LIMIT` means 80% or more but below the limit; `EXHAUSTED` means used is at least the limit (including a zero limit). Negative, missing or unparseable usage/limit values are `UNKNOWN`. Remaining is clamped at zero. A deployment may require more capacity than the reported headroom; VM family and total regional vCPU quotas both matter. These are provider-specific usage metrics, not a complete quota inventory. Some subscriptions may lack permissions or expose no usage metrics. SQL remaining-entitlement counters ending in DaysLeft, MonthsLeft or TokensLeft are `INFORMATIONAL`: the raw reported Used and Limit are preserved, but remaining/percent calculations and demand comparisons are disabled. Long unit names are abbreviated in the console; CSV/JSON retain the original units.
 
 ## Azure Policy screening (P)
 
@@ -189,7 +189,7 @@ Alternatively, copy [examples/preflight.example.json](examples/preflight.example
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 ```
 
-Configuration uses the named parameters as JSON keys, string arrays for Regions/Resources/QuotaProviders, and true/false for switches. ConfigPath and explicit options cannot be combined (except NonInteractive). The example output file name is ignored by Git. Do not publish reports or private configs containing subscription IDs. JSON report output is optional and written only after checks return; early failures may produce no file. Use a fresh file path for each run and always inspect the process exit code.
+Configuration uses the named parameters as JSON keys, string arrays for Regions/Resources/QuotaProviders, and true/false for switches. ConfigPath and explicit options cannot be combined (except NonInteractive). Copy the example to `preflight.local.json` and replace the placeholder subscription and regions before running it. The example output file name and private local config are ignored by Git. Do not publish reports or private configs containing subscription IDs. JSON report output is optional and written only after checks return; early failures may produce no file. Use a fresh file path for each run and always inspect the process exit code.
 
 | Exit code | Meaning |
 | --- | --- |
@@ -197,7 +197,7 @@ Configuration uses the named parameters as JSON keys, string arrays for Regions/
 | 1 | Regional support missing, provider not registered, SKU restriction/not listed, potential policy denial, or warnings in strict mode. |
 | 2 | Invalid configuration, CLI/metadata error, missing/unknown required results, unconfirmed registration or subscription restoration failure. Takes precedence over 1. |
 
-GLOBAL is inconclusive for a regional deployment and returns 2. Quota NEAR_LIMIT/EXHAUSTED, zone restrictions, audit and policy review/no assignments are warnings; `-FailOnWarning` makes these return 1. Quota errors/unknown data return 2. The gate is deliberately conservative; use specific resources rather than the full catalog. A green result is **not** a guarantee of deployability. Policy exemptions, overrides and conditions may require manual review. The caller must authenticate the CLI, arrange permissions, and stop deployment on nonzero codes. No Azure deployment, policy enforcement or provider registration is performed.
+GLOBAL is inconclusive for a regional deployment and returns 2. Quota NEAR_LIMIT/EXHAUSTED, zone restrictions, audit and policy review/no assignments are warnings; `-FailOnWarning` makes these return 1. Quota errors/unknown data return 2. Explicit `NOT_REGISTERED` and SQL SKU `UNAVAILABLE` are blocking findings; pending or unknown registration returns 2. `INFORMATIONAL` quota rows do not create warnings or blocking findings by themselves. The gate is deliberately conservative; use specific resources rather than the full catalog. A green result is **not** a guarantee of deployability. Policy exemptions, overrides and conditions may require manual review. The caller must authenticate the CLI, arrange permissions, and stop deployment on nonzero codes. No Azure deployment, policy enforcement or provider registration is performed.
 
 For a pipeline, authenticate using its supported Azure identity mechanism (prefer workload identity federation) before this step; do not commit credentials. The existing Pester CI remains offline and uses mocks. No live Azure pipeline has been configured by this update.
 
@@ -205,7 +205,7 @@ For a pipeline, authenticate using its supported Azure identity mechanism (prefe
 
 - **K:** Ten SKU categories. API Management uses the subscription SKU API; the two AI entries check account SKU tiers, not model or deployment type availability. Interactive selection supports multiple services and regional tables. Automation supports multiple exact service/SKU pairs via `SkuRequests`.
 - **U:** Six quota providers, with the original four retained as the automation default for compatibility. Explicitly select `CognitiveServices` or `ContainerApps` to query the additional providers. The CLI or an extension may be required; install it separately if needed.
-- **D:** Compare additional requested units with regional quota headroom. Copy the exact quota label from the U report and use `Provider|quota label|additional units` (decimal dot). Supply the total additional units for each quota, in its reported unit. Check both total and family vCPU quotas where applicable. `FITS`, `INSUFFICIENT`, `UNKNOWN`. Duplicate demand for the same provider and label is rejected.
+- **D:** Compare additional requested units with regional quota headroom. In interactive mode, select a quota from the numbered list and enter additional units (decimal dot). The prompt is skipped if there are no usable quotas. In automation, continue to use `Provider|quota label|additional units` (decimal dot). Supply the total additional units for each quota, in its reported unit. Check both total and family vCPU quotas where applicable. `FITS`, `INSUFFICIENT`, `UNKNOWN`. Duplicate demand for the same provider and label is rejected.
 - **Z:** Virtual Machine, Managed Disk and API Management SKU zone metadata. The interactive view checks logical zones 1, 2 and 3; automation accepts explicit zone numbers. `LISTED`, `RESTRICTED`, `NOT_LISTED`, `UNKNOWN`, `ERROR`. Empty zone metadata does not prove lack of zone support. No live capacity check, no physical zone mapping across subscriptions.
 - **R:** Query the current caller's management-plane grants at an existing resource group with the Azure Authorization permissions API. Use exact ARM actions, such as `Microsoft.Storage/storageAccounts/write`. `GRANT_LISTED` and `GRANT_NOT_LISTED` are evidence, not a complete authorization evaluation. Deny assignments, ABAC conditions, PIM changes, data-plane, locks, dependent actions and child scopes are not evaluated.
 - **A:** Name availability for Storage Account, Key Vault, Container Registry, API Management and Cosmos DB. `AVAILABLE`, `UNAVAILABLE`, `NOT_FOUND`, `UNKNOWN`, `ERROR`. Cosmos DB checks name existence; `NOT_FOUND` is inconclusive for availability and returns exit 2 in automation. A nonexisting name can still be invalid. Names are checked at the service namespace, not per region, and are not reserved.
@@ -243,6 +243,7 @@ An explicit zone restriction, unavailable name or insufficient requested quota p
 
 ## Version history
 
+- **3.8.1:** Live-test fixes for subscription selection, provider registration, SKU and quota interpretation, diagnostics and interactive workflow.
 - **3.8:** Resource name availability.
 - **3.7:** Caller RBAC grant screening.
 - **3.6:** SKU availability zones.

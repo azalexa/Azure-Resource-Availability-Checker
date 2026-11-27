@@ -1,7 +1,7 @@
 ﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
-    Azure Resource Availability Checker v3.8. Interactive, read-only regional availability checker.
+    Azure Resource Availability Checker v3.8.1. Interactive, read-only regional availability checker.
 .DESCRIPTION
     Uses Azure CLI and the selected subscription. Does not register providers,
     deploy resources. Includes optional SKU, quota and policy screening checks. Defaults to all resource types
@@ -52,10 +52,102 @@ function Invoke-AzJson {
             }
         }
     }
-    $raw = & $CliPath @cliArguments --only-show-errors --output json
-    if ($LASTEXITCODE -ne 0) { throw "Azure CLI command failed: az $($Arguments -join ' ')" }
+    $stderrPath = [IO.Path]::GetTempFileName()
+    try {
+        # Keep native stderr separate from JSON; Windows PowerShell can surface stderr as error records.
+        $ErrorActionPreference = 'Continue'
+        $PSNativeCommandUseErrorActionPreference = $false
+        $raw = & $CliPath @cliArguments --only-show-errors --output json 2> $stderrPath
+        $nativeExit = $LASTEXITCODE
+        if ($nativeExit -ne 0) {
+            $diagnostic = (Get-Content -LiteralPath $stderrPath -Raw -ErrorAction SilentlyContinue)
+            if ($diagnostic) { $diagnostic = ($diagnostic -replace '\s+',' ').Trim() }
+            throw "Azure CLI command failed (exit $nativeExit): az $($Arguments -join ' '). $diagnostic"
+        }
+    } finally { Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue }
     if (-not $raw) { throw 'Azure CLI returned no data.' }
     ($raw -join "`n") | ConvertFrom-Json -ErrorAction Stop
+}
+
+function Resolve-SubscriptionSelection {
+    param([object[]]$Subscriptions,[string]$Requested)
+    $matches = @($Subscriptions | Where-Object Id -eq $Requested)
+    if (-not $matches.Count) { $matches = @($Subscriptions | Where-Object AccountName -eq $Requested) }
+    if (-not $matches.Count) { throw "Subscription not found among enabled subscriptions: $Requested" }
+    if ($matches.Count -gt 1) { throw 'Multiple subscriptions match this name; use its ID.' }
+    return $matches[0]
+}
+
+function Test-AppServiceSku {
+    param([string]$Sku)
+    # Azure CLI list-locations accepted values observed in v3.8 live testing.
+    return ($Sku -match '^(F1|FREE|D1|SHARED|B[1-3]|S[1-3]|P[1-3]V2|P[0-3]V[34]|P[1-5]MV[34]|I[1-6]V2|I[1-5]MV2|WS[1-3])$')
+}
+
+function Get-ProviderCheckStatus {
+    param([string]$Namespace,[string]$SubId)
+    try {
+        $provider = Invoke-AzJson @('provider','show','--namespace',$Namespace,'--subscription',$SubId)
+        $state = [string]$provider.registrationState
+        $status = switch ($state) {
+            'Registered' { 'REGISTERED' }
+            'NotRegistered' { 'NOT_REGISTERED' }
+            'Registering' { 'REGISTERING' }
+            'Unregistering' { 'REGISTRATION_UNKNOWN' }
+            default { 'REGISTRATION_UNKNOWN' }
+        }
+        [pscustomobject]@{Status=$status;Detail="$Namespace registration: $state. No automatic registration performed."}
+    } catch {
+        [pscustomobject]@{Status='REGISTRATION_UNKNOWN';Detail="$Namespace registration query failed: $($_.Exception.Message)"}
+    }
+}
+
+function Get-SqlSkuStatus {
+    param($Sku,[string]$Name,$Edition)
+    if (-not $Name -or $Name -eq '(unparsed)') { return 'UNKNOWN' }
+    # A visible catalog entry is not necessarily provisionable. Explicit
+    # negative capability metadata at either level takes precedence.
+    foreach ($entry in @($Sku,$Edition)) {
+        if ($null -eq $entry) { continue }
+        if (($entry.available -is [bool] -and -not $entry.available) -or $entry.status -in @('Visible','Disabled','Unavailable','NotAvailable')) { return 'UNAVAILABLE' }
+    }
+    if ($null -ne $Edition -and $Edition.status -and $Edition.status -notin @('Available','Default')) { return 'UNKNOWN' }
+    if ($Sku.status -and $Sku.status -notin @('Available','Default')) { return 'UNKNOWN' }
+    if (($Sku.available -is [bool] -and $Sku.available) -or $Sku.status -in @('Available','Default')) { return 'LISTED' }
+    return 'UNKNOWN'
+}
+
+function Get-SqlSkuRows {
+    param([object[]]$Data,$Region,[string]$SubId)
+    foreach ($edition in $Data) {
+        if ($null -eq $edition) { continue }
+        if ($edition.PSObject.Properties['supportedServiceLevelObjectives']) {
+            $objectives = @($edition.supportedServiceLevelObjectives | Where-Object { $_ })
+            if (-not $objectives.Count) {
+                New-SkuRow $Region 'SQL Database' '(unparsed)' $edition.name 'UNKNOWN' (ConvertTo-Json -InputObject $edition -Depth 30 -Compress) $SubId
+                continue
+            }
+            foreach ($objective in $objectives) {
+                # The service objective name includes capacity (e.g. GP_Gen5_2).
+                $name = if ($objective.name) { $objective.name } elseif ($objective.serviceObjectiveName) { $objective.serviceObjectiveName } else { '(unparsed)' }
+                $tier = if ($objective.sku.tier) { $objective.sku.tier } else { $edition.name }
+                $status = Get-SqlSkuStatus $objective $name $edition
+                $detail = ConvertTo-Json -InputObject ([pscustomobject]@{Edition=$edition.name;EditionStatus=$edition.status;EditionReason=$edition.reason;Objective=$objective}) -Depth 30 -Compress
+                New-SkuRow $Region 'SQL Database' $name $tier $status $detail $SubId
+            }
+        } else {
+            # Retain compatibility with flat CLI response shapes.
+            $name = if ($edition.serviceObjective) { $edition.serviceObjective } elseif ($edition.serviceObjectiveName) { $edition.serviceObjectiveName } elseif ($edition.sku.name) { $edition.sku.name } elseif ($edition.name) { $edition.name } else { '(unparsed)' }
+            $tier = if ($edition.edition) { $edition.edition } else { $edition.sku.tier }
+            New-SkuRow $Region 'SQL Database' $name $tier (Get-SqlSkuStatus $edition $name) (ConvertTo-Json -InputObject $edition -Depth 30 -Compress) $SubId
+        }
+    }
+}
+
+function Test-InformationalQuota {
+    param([string]$Provider,[string]$Label,[string]$Metric)
+    # Remaining entitlement counters are not consumed resource capacity.
+    return ($Provider -eq 'SQL' -and ($Label -match '(Days|Months|Tokens)Left$' -or $Metric -match '(Days|Months|Tokens)Left$'))
 }
 
 function Select-Menu {
@@ -189,13 +281,13 @@ function Get-SkuRestrictionStatus {
 function Show-CheckTable {
     param([object[]]$Rows, [string[]]$Columns)
     $width = 140
-    try { $width = [Math]::Max(90, $Host.UI.RawUI.BufferSize.Width) } catch { }
+    try { $width = [Math]::Min(180,[Math]::Max(80, $Host.UI.RawUI.WindowSize.Width)) } catch { }
     $table = $Rows | Format-Table -Property $Columns -AutoSize -Wrap | Out-String -Stream -Width $width
     foreach ($line in $table) {
         $color = switch -Regex ($line) {
             '^\s*(LISTED|HEADROOM|FITS|AVAILABLE)\s' { 'Green'; break }
-            '^\s*(RESTRICTED|EXHAUSTED|ERROR|NOT_LISTED|POTENTIAL_DENY|UNAVAILABLE|INSUFFICIENT)\s' { 'Red'; break }
-            '^\s*(ZONE_RESTRICTED|RESTRICTION_UNKNOWN|UNKNOWN|NEAR_LIMIT|NO_DATA|REVIEW|AUDIT|NO_ASSIGNMENTS|GRANT_LISTED|GRANT_NOT_LISTED|NOT_FOUND)\s' { 'Yellow'; break }
+            '^\s*(RESTRICTED|EXHAUSTED|ERROR|NOT_LISTED|POTENTIAL_DENY|UNAVAILABLE|INSUFFICIENT|NOT_REGISTERED)\s' { 'Red'; break }
+            '^\s*(ZONE_RESTRICTED|RESTRICTION_UNKNOWN|UNKNOWN|NEAR_LIMIT|NO_DATA|REGISTERING|REGISTRATION_UNKNOWN|INFORMATIONAL|REVIEW|AUDIT|NO_ASSIGNMENTS|GRANT_LISTED|GRANT_NOT_LISTED|NOT_FOUND)\s' { 'Yellow'; break }
             default { 'Gray' }
         }
         Write-Host $line -ForegroundColor $color
@@ -211,18 +303,34 @@ function Invoke-SkuCheck {
     $appSku = $null; $appLinux = $false
     if ($RequestedService) {
         $appSku = $RequestedSku
+        if ($RequestedService -eq 'App Service Plan' -and -not (Test-AppServiceSku $appSku)) { throw 'Invalid App Service SKU.' }
         $appLinux = $LinuxWorkers.IsPresent
     } elseif ('App Service Plan' -in $services.Name) {
-        do { $appSku = (Read-Host 'App Service SKU (e.g. B1, P1V3)').Trim().ToUpperInvariant() } until ($appSku -match '^[A-Z0-9]+$')
-        $appLinux = ((Read-Host 'Linux workers? [y/N]').Trim() -eq 'Y')
+        do {
+            $appSku = (Read-Host 'App Service SKU (e.g. B1, P1V3; Enter to skip)').Trim().ToUpperInvariant()
+            if ($appSku -and -not (Test-AppServiceSku $appSku)) { Write-Host 'Invalid App Service SKU. Enter a supported SKU or press Enter to skip.' -ForegroundColor Yellow }
+        } until (-not $appSku -or (Test-AppServiceSku $appSku))
+        if (-not $appSku) { $services = @($services | Where-Object Name -ne 'App Service Plan') }
+        else { $appLinux = ((Read-Host 'Linux workers? [y/N]').Trim() -eq 'Y') }
+        if (-not $services.Count) { Write-Host 'No SKU services selected.'; return }
     }
     $filter = if ($RequestedService) { $RequestedSku } else { (Read-Host 'Filter SKU names (optional, Enter for all)').Trim() }
     $storageCache = $null
+    $providerMap = @{'Virtual Machine'='Microsoft.Compute';'Managed Disk'='Microsoft.Compute';'Storage Account'='Microsoft.Storage';'App Service Plan'='Microsoft.Web';'SQL Database'='Microsoft.Sql';'PostgreSQL Flexible Server'='Microsoft.DBforPostgreSQL';'MySQL Flexible Server'='Microsoft.DBforMySQL';'API Management'='Microsoft.ApiManagement';'Azure OpenAI'='Microsoft.CognitiveServices';'Azure AI Services'='Microsoft.CognitiveServices'}
+    $providerCache = @{}
     $results = @(foreach ($region in $regions) {
         foreach ($service in $services.Name) {
             Write-Host "Checking $service SKU metadata in $($region.DisplayName)..." -ForegroundColor Cyan
             try {
                 Assert-Subscription $SubId
+                $namespace = $providerMap[$service]
+                if (-not $providerCache.ContainsKey($namespace)) { $providerCache[$namespace] = Get-ProviderCheckStatus $namespace $SubId }
+                $registration = $providerCache[$namespace]
+                # Skip the deployment-oriented SKU query if registration is not confirmed; do not label the SKU unavailable.
+                if ($registration.Status -ne 'REGISTERED') {
+                    New-SkuRow $region $service $filter '' $registration.Status $registration.Detail $SubId
+                    continue
+                }
                 $rows = @(switch ($service) {
                     { $_ -in @('Virtual Machine','Managed Disk') } {
                         $resourceType = if ($service -eq 'Virtual Machine') { 'virtualMachines' } else { 'disks' }
@@ -263,18 +371,13 @@ function Invoke-SkuCheck {
                         $data = @(Invoke-AzJson $cliArgs)
                         $names = @($data | ForEach-Object { if ($_ -is [string]) { $_ } else { $_.name; $_.displayName } } | Where-Object { $_ } | ForEach-Object { Normalize-Location $_ })
                         $aliases = @(@($region.Name,$region.DisplayName,$region.RegionalDisplayName) | Where-Object { $_ } | ForEach-Object { Normalize-Location $_ })
-                        $status = if (@($aliases | Where-Object { $_ -in $names }).Count) { 'LISTED' } elseif ($data.Count -gt 0 -and -not $names.Count) { 'UNKNOWN' } else { 'NOT_LISTED' }
+                        $status = if (@($aliases | Where-Object { $_ -in $names }).Count) { 'LISTED' } elseif (-not $names.Count) { 'UNKNOWN' } else { 'NOT_LISTED' }
                         $tier = if ($appLinux) { 'Linux workers' } else { 'Default (no Linux filter)' }
                         New-SkuRow $region $service $appSku $tier $status 'App Service location list for requested SKU; not a capacity check.' $SubId
                     }
                     'SQL Database' {
-                        $data = @(Invoke-AzJson @('sql','db','list-editions','--location',$region.Name,'--available','--subscription',$SubId))
-                        foreach ($sku in $data) {
-                            $name = if ($sku.serviceObjective) { $sku.serviceObjective } elseif ($sku.serviceObjectiveName) { $sku.serviceObjectiveName } elseif ($sku.sku.name) { $sku.sku.name } elseif ($sku.name) { $sku.name } else { '(unparsed)' }
-                            $status = if ($name -eq '(unparsed)') { 'UNKNOWN' } else { 'LISTED' }
-                            $tier = if ($sku.edition) { $sku.edition } else { $sku.sku.tier }
-                            New-SkuRow $region $service $name $tier $status (ConvertTo-Json -InputObject $sku -Depth 30 -Compress) $SubId
-                        }
+                        $data = @(Invoke-AzJson @('sql','db','list-editions','--location',$region.Name,'--subscription',$SubId))
+                        Get-SqlSkuRows -Data $data -Region $region -SubId $SubId
                     }
                     { $_ -in @('PostgreSQL Flexible Server','MySQL Flexible Server') } {
                         $engine = if ($service -eq 'PostgreSQL Flexible Server') { 'postgres' } else { 'mysql' }
@@ -321,8 +424,21 @@ function Invoke-SkuCheck {
         Write-Host "`n=== SKU report: $($region.DisplayName) ===" -ForegroundColor Cyan
         Show-CheckTable -Rows @($results | Where-Object RegionCode -eq $region.Name | Sort-Object Service,SKU,Tier) -Columns @('Status','Service','SKU','Tier')
     }
+    Show-ReportDiagnostics $results
     Write-Host 'LISTED is catalog evidence only. Restrictions, quotas, policy and capacity can prevent deployment. UNKNOWN means unparsed or missing metadata; export CSV for raw details.' -ForegroundColor Yellow
     return $results
+}
+
+function Show-ReportDiagnostics {
+    param([object[]]$Rows)
+    foreach ($r in @($Rows | Where-Object { $_.Status -in @('ERROR','NOT_REGISTERED','REGISTERING','REGISTRATION_UNKNOWN','NO_DATA') })) {
+        Write-Host "$($r.Status) [$($r.Region) / $($r.Service)]: $($r.Detail)" -ForegroundColor Yellow
+    }
+}
+
+function New-QuotaDiagnosticRow {
+    param($Region,[string]$Service,[string]$Status,[string]$Detail,[string]$SubId)
+    [pscustomobject]@{Region=$Region.DisplayName;RegionCode=$Region.Name;Service=$Service;Quota='';Used=$null;Limit=$null;Remaining=$null;Percent=$null;Unit='';Status=$Status;Detail=$Detail;SubscriptionId=$SubId}
 }
 
 function Invoke-QuotaCheck {
@@ -338,11 +454,21 @@ function Invoke-QuotaCheck {
     )
     $services = if ($RequestedProviders.Count) { @($menu | Where-Object { ($_.Name -split ' ',2)[0] -in $RequestedProviders }) } else { @(Select-Menu -Title 'Quota providers' -Items $menu -Multiple) }
     if (-not $services) { throw 'No quota providers selected.' }
+    $providerMap = @{Compute='Microsoft.Compute';Network='Microsoft.Network';Storage='Microsoft.Storage';SQL='Microsoft.Sql';CognitiveServices='Microsoft.CognitiveServices';ContainerApps='Microsoft.App'}
+    $providerCache = @{}
     $results = @(foreach ($region in $regions) {
         foreach ($service in $services) {
             Write-Host "Checking $($service.Name) in $($region.DisplayName)..." -ForegroundColor Cyan
             try {
                 Assert-Subscription $SubId
+                $providerKey = ($service.Name -split ' ',2)[0]
+                $namespace = $providerMap[$providerKey]
+                if (-not $providerCache.ContainsKey($namespace)) { $providerCache[$namespace] = Get-ProviderCheckStatus $namespace $SubId }
+                $registration = $providerCache[$namespace]
+                if ($registration.Status -ne 'REGISTERED') {
+                    New-QuotaDiagnosticRow $region $service.Name $registration.Status $registration.Detail $SubId
+                    continue
+                }
                 $data = @(Invoke-AzJson ($service.Command + @('--location',$region.Name,'--subscription',$SubId)))
                 $data = @(foreach ($entry in $data) { if ($entry.PSObject.Properties['value'] -and $entry.value -is [array]) { $entry.value } else { $entry } })
                 if (-not $data.Count) {
@@ -359,6 +485,7 @@ function Invoke-QuotaCheck {
                         if ($l -gt 0) { $pct=[Math]::Round(100*$u/$l,1) }
                         $status = if ($u -ge $l) { 'EXHAUSTED' } elseif ($pct -ge 80) { 'NEAR_LIMIT' } else { 'HEADROOM' }
                     }
+                    if (Test-InformationalQuota $providerKey $name ([string]$item.name.value)) { $status='INFORMATIONAL'; $remaining=$null; $pct=$null }
                     [pscustomobject]@{Region=$region.DisplayName; RegionCode=$region.Name; Service=$service.Name; Quota=$name; Used=$used; Limit=$limit; Remaining=$remaining; Percent=$pct; Unit=$item.unit; Status=$status; Detail=(ConvertTo-Json -InputObject $item -Depth 12 -Compress); SubscriptionId=$SubId}
                 }
             } catch {
@@ -368,8 +495,11 @@ function Invoke-QuotaCheck {
     })
     foreach ($region in $regions) {
         Write-Host "`n=== Quota report: $($region.DisplayName) ===" -ForegroundColor Cyan
-        Show-CheckTable -Rows @($results | Where-Object RegionCode -eq $region.Name | Sort-Object Service,Quota) -Columns @('Status','Service','Quota','Used','Limit','Remaining','Percent','Unit')
+        $displayRows = @($results | Where-Object RegionCode -eq $region.Name | Sort-Object Service,Quota | Select-Object Status,@{Name='Service';Expression={($_.Service -split ' ',2)[0]}},Quota,Used,Limit,Remaining,Percent,@{Name='Unit';Expression={if ([string]$_.Unit -eq $_.Quota -or ([string]$_.Unit).Length -gt 20) {'(raw)'} else {$_.Unit}}})
+        Show-CheckTable -Rows $displayRows -Columns @('Status','Service','Quota','Used','Limit','Remaining','Percent','Unit')
     }
+    Show-ReportDiagnostics $results
+    Write-Host 'INFORMATIONAL: Used is the raw reported counter, not consumed capacity. (raw) units are preserved in CSV/JSON.' -ForegroundColor Yellow
     Write-Host 'NEAR_LIMIT starts at 80%. HEADROOM does not mean a proposed deployment fits. Compute total and family quotas must both be checked.' -ForegroundColor Yellow
     return $results
 }
@@ -858,7 +988,10 @@ function Invoke-RbacCheck {
         $detail = if ($problem) { $problem } else { 'Caller control-plane permission metadata only; deny assignments, conditions, locks, data-plane and other scopes are not evaluated.' }
         [pscustomobject]@{Region='(scope)';Scope=$scope;Action=$action;Status=$status;Detail=$detail;SubscriptionId=$SubId}
     })
-    Show-CheckTable -Rows $rows -Columns @('Status','Action','Scope','Detail')
+    Write-Host "Scope: $scope"
+    Show-CheckTable -Rows $rows -Columns @('Status','Action')
+    if ($problem) { Write-Host $problem -ForegroundColor Red }
+    else { Write-Host 'Caller control-plane permission metadata only; deny assignments, conditions, locks, data-plane and other scopes are not evaluated.' -ForegroundColor Yellow }
     return $rows
 }
 
@@ -918,6 +1051,23 @@ function Get-QuotaDemandRows {
     }
 }
 
+function Select-QuotaDemandRequest {
+    param([object[]]$Quota)
+    $choices = @($Quota | Where-Object { $_.Status -in @('HEADROOM','NEAR_LIMIT','EXHAUSTED') -and $null -ne $_.Remaining -and $_.Quota } | ForEach-Object {
+        $provider = ($_.Service -split ' ',2)[0]
+        [pscustomobject]@{Name="$provider | $($_.Quota)";Provider=$provider;Quota=$_.Quota}
+    } | Sort-Object Name -Unique)
+    if (-not $choices.Count) { Write-Host 'No usable quota data; demand comparison skipped.' -ForegroundColor Yellow; return }
+    $choice = Select-Menu -Title 'Quota to compare' -Items $choices
+    do {
+        $amount = (Read-Host 'Additional units (decimal dot)').Trim()
+        $value = 0.0
+        $valid = $amount -match '^[0-9]+(\.[0-9]+)?$' -and [double]::TryParse($amount,[Globalization.NumberStyles]::AllowDecimalPoint,[Globalization.CultureInfo]::InvariantCulture,[ref]$value) -and -not [double]::IsInfinity($value) -and $value -gt 0
+        if (-not $valid) { Write-Host 'Enter a positive number, using a decimal dot.' -ForegroundColor Yellow }
+    } until ($valid)
+    return "$($choice.Provider)|$($choice.Quota)|$amount"
+}
+
 function Get-ExtendedFindings {
     param([string]$Kind,[object[]]$Rows)
     if (-not $Rows.Count) { [pscustomobject]@{Check=$Kind;Region='';Subject='';Severity='ERROR';Reason='No report rows returned.'}; return }
@@ -969,7 +1119,7 @@ function Get-CheckerOptions {
     if ([bool]$opts.SkuService -ne [bool]$opts.SkuName) { throw 'SkuService and SkuName must be provided together.' }
     if ($opts.SkuService -and $opts.SkuService -notin @('Virtual Machine','Managed Disk','Storage Account','App Service Plan','SQL Database','PostgreSQL Flexible Server','MySQL Flexible Server','API Management','Azure OpenAI','Azure AI Services')) { throw 'Unsupported SKU service.' }
     if ($opts.SkuName -and $opts.SkuName -notmatch '^[A-Za-z0-9._ -]+$') { throw 'Invalid SKU name.' }
-    if ($opts.SkuService -eq 'App Service Plan' -and $opts.SkuName -notmatch '^[A-Za-z0-9]+$') { throw 'Invalid App Service SKU.' }
+    if ($opts.SkuService -eq 'App Service Plan' -and -not (Test-AppServiceSku $opts.SkuName)) { throw 'Invalid App Service SKU.' }
     if ($opts.AppLinux -and $opts.SkuService -ne 'App Service Plan' -and -not @($opts.SkuRequests | Where-Object { $_ -like 'App Service Plan|*' }).Count) { throw 'AppLinux requires App Service Plan.' }
     if ($opts.QuotaProviders.Count -and -not $opts.CheckQuota) { throw 'QuotaProviders requires CheckQuota.' }
     if ($opts.CheckQuota -and -not $opts.QuotaProviders.Count) { $opts.QuotaProviders = @('Compute','Network','Storage','SQL') }
@@ -978,7 +1128,7 @@ function Get-CheckerOptions {
     if ($opts.SkuRequests.Count -and $opts.SkuService) { throw 'Use SkuRequests or SkuService/SkuName, not both.' }
     foreach ($request in $opts.SkuRequests) {
         $parts = $request -split '\|',2
-        if ($parts.Count -ne 2 -or $parts[0] -notin @('Virtual Machine','Managed Disk','Storage Account','App Service Plan','SQL Database','PostgreSQL Flexible Server','MySQL Flexible Server','API Management','Azure OpenAI','Azure AI Services') -or $parts[1] -notmatch '^[A-Za-z0-9._ -]+$' -or ($parts[0] -eq 'App Service Plan' -and $parts[1] -notmatch '^[A-Za-z0-9]+$')) { throw 'SkuRequests entries must be Service|exact SKU.' }
+        if ($parts.Count -ne 2 -or $parts[0] -notin @('Virtual Machine','Managed Disk','Storage Account','App Service Plan','SQL Database','PostgreSQL Flexible Server','MySQL Flexible Server','API Management','Azure OpenAI','Azure AI Services') -or $parts[1] -notmatch '^[A-Za-z0-9._ -]+$' -or ($parts[0] -eq 'App Service Plan' -and -not (Test-AppServiceSku $parts[1]))) { throw 'SkuRequests entries must be Service|exact SKU.' }
     }
     if ($opts.QuotaDemand.Count -and -not $opts.CheckQuota) { throw 'QuotaDemand requires CheckQuota.' }
     if ([bool]$opts.RbacActions.Count -ne [bool]$opts.RbacGroup) { throw 'RbacGroup and RbacActions must be supplied together.' }
@@ -1012,19 +1162,20 @@ function Get-PreflightDecision {
         if (-not @($rows | Where-Object { $_ }).Count -and $expected) { [pscustomobject]@{Check=$kind;Region='';Subject='';Severity='ERROR';Reason='No report rows returned.'} }
         foreach ($row in @($rows | Where-Object { $_ })) {
             $severity = ''; $reason = [string]$row.Status
-            if ($row.Status -in @('ERROR','NO_DATA','UNKNOWN','RESTRICTION_UNKNOWN')) { $severity = 'ERROR' }
+            if ($row.Status -in @('ERROR','NO_DATA','UNKNOWN','RESTRICTION_UNKNOWN','REGISTERING','REGISTRATION_UNKNOWN')) { $severity = 'ERROR' }
+            elseif ($row.Status -eq 'NOT_REGISTERED') { $severity='BLOCK' }
             elseif ($kind -eq 'availability') {
                 if ($row.Status -eq 'NOT_SUPPORTED') { $severity = 'BLOCK' }
                 elseif ($row.Status -ne 'SUPPORTED') { $severity = 'ERROR' }
                 if ($row.Registration -eq 'NotRegistered' -and -not $severity) { $severity='BLOCK'; $reason='Provider not registered.' }
                 elseif ($row.Registration -ne 'Registered' -and -not $severity) { $severity='ERROR'; $reason='Provider registration not confirmed.' }
             } elseif ($kind -eq 'sku') {
-                if ($row.Status -in @('RESTRICTED','NOT_LISTED')) { $severity='BLOCK' }
+                if ($row.Status -in @('RESTRICTED','NOT_LISTED','UNAVAILABLE')) { $severity='BLOCK' }
                 elseif ($row.Status -eq 'ZONE_RESTRICTED') { $severity='WARNING' }
                 elseif ($row.Status -ne 'LISTED') { $severity='ERROR' }
             } elseif ($kind -eq 'quota') {
                 if ($row.Status -in @('NEAR_LIMIT','EXHAUSTED')) { $severity='WARNING'; $reason += ' (deployment demand not supplied)' }
-                elseif ($row.Status -ne 'HEADROOM') { $severity='ERROR' }
+                elseif ($row.Status -notin @('HEADROOM','INFORMATIONAL')) { $severity='ERROR' }
             } elseif ($kind -eq 'policy') {
                 if ($row.Status -eq 'POTENTIAL_DENY') { $severity='BLOCK' }
                 elseif ($row.Status -in @('REVIEW','NO_ASSIGNMENTS','AUDIT')) { $severity='WARNING' }
@@ -1071,7 +1222,7 @@ function Invoke-CheckerPreflight {
     if ($Options.QuotaDemand.Count) { $demand = @(Get-QuotaDemandRows -Quota $quota -Regions $selected -Requests $Options.QuotaDemand -SubId $SubId); $extra += @(Get-ExtendedFindings demand $demand); Show-CheckTable -Rows $demand -Columns @('Status','Region','Service','Quota','Requested','Remaining','Unit') }
     $decision.Findings = @($decision.Findings) + @($extra)
     $decision.ExitCode = if (@($decision.Findings | Where-Object Severity -eq 'ERROR').Count) { 2 } elseif (@($decision.Findings | Where-Object Severity -eq 'BLOCK').Count -or ($Options.FailOnWarning -and @($decision.Findings | Where-Object Severity -eq 'WARNING').Count)) { 1 } else { 0 }
-    $report = [pscustomobject]@{Version='3.8';GeneratedUtc=[DateTime]::UtcNow.ToString('o');SubscriptionId=$SubId;ExitCode=$decision.ExitCode;Findings=@($decision.Findings);Availability=$availability;Sku=$sku;Quota=$quota;Policy=$policy;Zones=$zones;Rbac=$rbac;Names=$names;QuotaDemand=$demand}
+    $report = [pscustomobject]@{Version='3.8.1';GeneratedUtc=[DateTime]::UtcNow.ToString('o');SubscriptionId=$SubId;ExitCode=$decision.ExitCode;Findings=@($decision.Findings);Availability=$availability;Sku=$sku;Quota=$quota;Policy=$policy;Zones=$zones;Rbac=$rbac;Names=$names;QuotaDemand=$demand}
     if ($Options.OutputJson) { ConvertTo-Json -InputObject $report -Depth 30 | Set-Content -LiteralPath $Options.OutputJson -Encoding UTF8 -ErrorAction Stop }
     if ($decision.Findings.Count) { $decision.Findings | Format-Table Check,Region,Severity,Subject,Reason -Wrap -AutoSize | Out-Host }
     Write-Host "Preflight exit code: $($decision.ExitCode). Metadata screening only; no deployment guarantee."
@@ -1090,18 +1241,16 @@ $automation = $NonInteractive -or [bool]$ConfigPath
 try {
     if ($automation) { $options = Get-CheckerOptions -Bound $checkerBound }
     elseif (@($checkerBound.Keys | Where-Object { $_ -in @('Subscription','Regions','Resources','SkuService','SkuName','AppLinux','CheckQuota','QuotaProviders','CheckPolicy','ResourceGroup','FailOnWarning','OutputJson','SkuRequests','QuotaDemand','ZoneRequests','RbacGroup','RbacActions','NameRequests') }).Count) { throw 'Use NonInteractive when supplying automation options.' }
-    Write-Host 'AZURE RESOURCE AVAILABILITY CHECKER v3.8' -ForegroundColor Cyan
+    Write-Host 'AZURE RESOURCE AVAILABILITY CHECKER v3.8.1' -ForegroundColor Cyan
     if (-not (Get-Command az -ErrorAction SilentlyContinue)) { throw 'Azure CLI not found. Install it first.' }
     $subscriptions = @(Invoke-AzJson @('account','list') | Where-Object { $_.state -eq 'Enabled' } | Sort-Object name | ForEach-Object {
         [pscustomobject]@{ Name = "$($_.name) ($($_.id))"; AccountName = $_.name; Id = $_.id }
     })
     if ($subscriptions.Count -eq 0) { throw 'No enabled subscription found. Run az login first.' }
     if ($automation) {
-        $matches = @($subscriptions | Where-Object { $_.Id -eq $options.Subscription -or $_.AccountName -eq $options.Subscription })
-        if ($matches.Count -ne 1) { throw 'Subscription not uniquely found; use its ID.' }
-        $subscription = $matches[0]
-    } else { $subscription = Select-Menu -Title 'Subscription' -Items $subscriptions }
-    $subId = $subscription.Id
+        $selectedSubscription = Resolve-SubscriptionSelection -Subscriptions $subscriptions -Requested $options.Subscription
+    } else { $selectedSubscription = Select-Menu -Title 'Subscription' -Items $subscriptions }
+    $subId = $selectedSubscription.Id
 
     $previousSubId = (Invoke-AzJson @('account','show')).id
     if (-not $previousSubId) { throw 'Cannot determine the current Azure CLI subscription.' }
@@ -1115,10 +1264,10 @@ try {
 
     if ($automation) { $exitCode = Invoke-CheckerPreflight -SubId $subId -Options $options -Catalog $catalog }
     else {
-    # Run the first check directly. Subsequent checks and exports are independent menu actions.
+    # Show the menu immediately after selection.
     $lastResults = @()
     $lastReportType = 'availability'
-    $action = 'N'
+    $action = ''
     while ($true) {
         if ($action -eq 'Q') { break }
         if ($action -eq 'N') {
@@ -1145,18 +1294,41 @@ try {
                     'D' {
                         $demandRegions = @(Select-AzureRegions $subId)
                         $usageRows = @(Invoke-QuotaCheck -SubId $subId -SelectedRegions $demandRegions)
-                        $request = (Read-Host 'Provider|exact quota label from table|additional units').Trim()
-                        $demandRows = @(Get-QuotaDemandRows -Quota $usageRows -Regions $demandRegions -Requests @($request) -SubId $subId)
-                        Show-CheckTable -Rows $demandRows -Columns @('Status','Region','Service','Quota','Requested','Remaining','Unit')
-                        $demandRows
+                        $request = Select-QuotaDemandRequest $usageRows
+                        if ($request) {
+                            $demandRows = @(Get-QuotaDemandRows -Quota $usageRows -Regions $demandRegions -Requests @($request) -SubId $subId)
+                            Show-CheckTable -Rows $demandRows -Columns @('Status','Region','Service','Quota','Requested','Remaining','Unit')
+                            $demandRows
+                        }
                     }
                 }
-                if (@($newResults | Where-Object { $_.Status -notin @('ERROR','NO_DATA') }).Count -gt 0) {
+                if (@($newResults | Where-Object { $_.Status -notin @('ERROR','NO_DATA','NOT_REGISTERED','REGISTERING','REGISTRATION_UNKNOWN') }).Count -gt 0) {
                     $lastResults = @($newResults)
                     $lastReportType = switch ($action) { 'K' {'sku'} 'U' {'quota'} 'P' {'policy'} 'Z' {'zones'} 'R' {'rbac'} 'A' {'names'} 'D' {'demand'} }
                 } else { Write-Host 'No usable new report; previous report retained.' -ForegroundColor Yellow }
             } catch [System.OperationCanceledException] { throw } catch {
                 Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
+            }
+        } elseif ($action -eq 'S') {
+            # Always restore the original CLI context on exit, even after multiple switches.
+            try {
+                Assert-Subscription $subId
+                $nextSubscription = Select-Menu -Title 'Subscription' -Items $subscriptions
+                if ($nextSubscription.Id -ne $subId) {
+                    $restoreSubscription = $true
+                    & az account set --subscription $nextSubscription.Id --only-show-errors
+                    if ($LASTEXITCODE -ne 0) { throw 'Cannot select the requested subscription.' }
+                    Assert-Subscription $nextSubscription.Id
+                    $selectedSubscription = $nextSubscription
+                    $subId = $selectedSubscription.Id
+                    $lastResults = @()
+                    $lastReportType = 'availability'
+                    Write-Host 'Subscription switched; previous report cleared.' -ForegroundColor Green
+                }
+            } catch [System.OperationCanceledException] { Write-Host 'Subscription switch cancelled.' } catch {
+                Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
+                # Do not continue if the CLI context is no longer the expected one.
+                Assert-Subscription $subId
             }
         } elseif ($action -eq 'E') {
             if ($lastResults.Count -eq 0) {
@@ -1172,7 +1344,7 @@ try {
         }
 
         Write-Host "`n=== Main menu ===" -ForegroundColor Cyan
-        Write-Host "Subscription: $($subscription.Name)"
+        Write-Host "Subscription: $($selectedSubscription.Name)"
         Write-Host '[Enter / N] New availability check (choose regions and scope)'
         Write-Host '[K] Check SKU availability'
         Write-Host '[U] Check quota and usage'
@@ -1187,12 +1359,13 @@ try {
         } else {
             Write-Host '[E] Export last report (no report available)' -ForegroundColor DarkGray
         }
+        Write-Host '[S] Switch subscription'
         Write-Host '[Q] Quit'
         do {
             $action = (Read-Host 'Select action [Enter for new check]').Trim().ToUpperInvariant()
             if ($action -eq '') { $action = 'N' }
-            if ($action -notin @('N','K','U','P','Z','R','A','D','E','Q')) { Write-Host 'Invalid selection. Try again.' -ForegroundColor Yellow }
-        } until ($action -in @('N','K','U','P','Z','R','A','D','E','Q'))
+            if ($action -notin @('N','K','U','P','Z','R','A','D','E','S','Q')) { Write-Host 'Invalid selection. Try again.' -ForegroundColor Yellow }
+        } until ($action -in @('N','K','U','P','Z','R','A','D','E','S','Q'))
     }
     }
 } catch [System.OperationCanceledException] {

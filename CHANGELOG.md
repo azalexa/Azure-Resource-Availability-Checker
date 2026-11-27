@@ -1,5 +1,14 @@
 # Changelog
 
+## 3.8.1
+
+- Fix the case-insensitive Subscription parameter/selection collision and distinguish missing from ambiguous subscriptions.
+- Open the main menu immediately and support switching subscriptions without restarting; clear old in-memory reports and retain original context restoration.
+- Validate App Service SKUs and allow skipping the service; expand unfiltered SQL editions into capacity-specific service objectives and classify explicit capability statuses, preserving restriction reasons.
+- Check provider registration before SKU and quota calls, never automatically register providers, and expose native CLI error diagnostics.
+- Preserve remaining SQL entitlement counters as informational, improve quota/RBAC console formatting, and select quota demand from usable rows.
+- Extend Pester regressions and conservative automation decisions.
+
 ## 3.8 (includes 3.5–3.7)
 
 - 3.5: Add API Management, Azure OpenAI and Azure AI Services account SKU checks; add Cognitive Services and Container Apps regional quota reports; multiple SKU requests and explicit quota demand.
