@@ -8,3 +8,7 @@ azure-availability-*.csv
 
 # Local CI test output
 TestResults.xml
+
+# Automation output and private configs
+azure-preflight-*.json
+preflight.local.json

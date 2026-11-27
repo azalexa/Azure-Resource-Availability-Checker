@@ -1,5 +1,12 @@
 # Changelog
 
+## 3.4
+
+- Add explicit automation inputs and JSON configuration without menu prompts.
+- Add optional JSON reports and conservative exit codes for CI/CD.
+- Reuse resource, SKU, quota and policy checks with selected inputs.
+- Add tests for automation options, gate decisions and prompt-free availability.
+
 ## 3.3
 
 - Add Pester regression tests for region availability, SKU restrictions, quota boundaries, policy conditions, menus, CSV and CLI errors.

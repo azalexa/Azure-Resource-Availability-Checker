@@ -1,4 +1,4 @@
-BeforeAll {
+﻿BeforeAll {
     . (Join-Path (Split-Path $PSScriptRoot -Parent) 'Azure-Resource-Availability-Checker.ps1')
     $region = [pscustomobject]@{ Name='westeurope'; DisplayName='West Europe'; RegionalDisplayName='(Europe) West Europe' }
     $sub = '00000000-0000-0000-0000-000000000001'
@@ -180,5 +180,79 @@ exit /b 0
     }
     It 'throws for invalid JSON' {
         { Invoke-AzJson -Arguments $fakeArgs -CliPath $fakeInvalid } | Should -Throw
+    }
+}
+
+
+Describe 'Automation configuration and gate decisions' {
+    BeforeAll {
+        $good = [pscustomobject]@{Region='West Europe';Status='SUPPORTED';Registration='Registered';Provider='Microsoft.Storage';ResourceType='storageAccounts'}
+        $inputOptions = @{Subscription='Example';Regions=@('westeurope');Resources=@('Microsoft.Storage/storageAccounts')}
+    }
+    It 'validates options without Azure or prompts' {
+        $opts = Get-CheckerOptions -Bound $inputOptions
+        $opts.Regions[0] | Should -Be 'westeurope'
+        $opts.Resources[0] | Should -Be 'Microsoft.Storage/storageAccounts'
+    }
+    It 'rejects missing required values' {
+        { Get-CheckerOptions -Bound @{Subscription='Example';Regions=@('westeurope')} } | Should -Throw '*required*'
+    }
+    It 'reads a JSON file and rejects mixing configuration with flags' {
+        $file = Join-Path $TestDrive 'config.json'
+        @{Subscription='Example';Regions=@('westeurope');Resources=@('Microsoft.Storage/storageAccounts');CheckQuota=$true} | ConvertTo-Json | Set-Content $file
+        $opts = Get-CheckerOptions -Bound @{ConfigPath=$file}
+        $opts.QuotaProviders.Count | Should -Be 4
+        { Get-CheckerOptions -Bound @{ConfigPath=$file;Subscription='Other'} } | Should -Throw '*not both*'
+    }
+    It 'rejects invalid quota provider and incomplete SKU request' {
+        { Get-CheckerOptions -Bound ($inputOptions + @{CheckQuota=$true;QuotaProviders=@('Other')}) } | Should -Throw '*Unsupported quota provider*'
+        { Get-CheckerOptions -Bound ($inputOptions + @{SkuService='Virtual Machine'}) } | Should -Throw '*together*'
+    }
+    It 'passes supported and registered resources' {
+        (Get-PreflightDecision -Availability @($good)).ExitCode | Should -Be 0
+    }
+    It 'blocks unregistered providers and unsupported regions' {
+        (Get-PreflightDecision -Availability @([pscustomobject]@{Status='SUPPORTED';Registration='NotRegistered'})).ExitCode | Should -Be 1
+        (Get-PreflightDecision -Availability @([pscustomobject]@{Status='NOT_SUPPORTED';Registration='Registered'})).ExitCode | Should -Be 1
+    }
+    It 'fails closed on missing or unknown metadata' {
+        (Get-PreflightDecision -Availability @([pscustomobject]@{Status='UNKNOWN'})).ExitCode | Should -Be 2
+        (Get-PreflightDecision -Availability @($good) -ExpectSku).ExitCode | Should -Be 2
+    }
+    It 'treats unrelated exhausted quota as advisory unless strict' {
+        $quota = @([pscustomobject]@{Status='EXHAUSTED';Quota='Unrelated'})
+        (Get-PreflightDecision -Availability @($good) -Quota $quota -ExpectQuota).ExitCode | Should -Be 0
+        (Get-PreflightDecision -Availability @($good) -Quota $quota -ExpectQuota -Strict).ExitCode | Should -Be 1
+    }
+    It 'blocks potential policy denial and gives errors precedence' {
+        $policy = @([pscustomobject]@{Status='POTENTIAL_DENY'})
+        (Get-PreflightDecision -Availability @($good) -Policy $policy -ExpectPolicy).ExitCode | Should -Be 1
+        (Get-PreflightDecision -Availability @($good) -Policy $policy -ExpectPolicy -ExpectSku).ExitCode | Should -Be 2
+    }
+    It 'resolves region display names and numbered region codes' {
+        Mock Assert-Subscription {}
+        Mock Invoke-AzJson { [pscustomobject]@{name='eastus2';displayName='East US 2';type='Region';metadata=[pscustomobject]@{regionType='Physical'}} }
+        @(Resolve-CheckerRegions -SubId $sub -Requested @('East US 2','eastus2')).Count | Should -Be 1
+        { Resolve-CheckerRegions -SubId $sub -Requested @('notaregion') } | Should -Throw '*not uniquely found*'
+    }
+    It 'checks explicit resources without calling Read-Host' {
+        Mock Read-Host { throw 'Unexpected prompt' }
+        Mock Invoke-AzJson { [pscustomobject]@{namespace='Microsoft.Storage';registrationState='Registered';resourceTypes=@([pscustomobject]@{resourceType='storageAccounts';locations=@('West Europe')})} }
+        $items = @(New-Resource 'Storage' 'Microsoft.Storage' 'storageAccounts')
+        $rows = @(Invoke-AvailabilityCheck -SubId $sub -Catalog @() -SelectedRegions @($region) -SelectedResources $items)
+        $rows[0].Status | Should -Be 'SUPPORTED'
+        Should -Invoke Read-Host -Times 0 -Exactly
+    }
+    It 'writes a structured JSON report without prompting' {
+        Mock Read-Host { throw 'Unexpected prompt' }
+        Mock Resolve-CheckerRegions { $region }
+        Mock Invoke-AvailabilityCheck { $good }
+        $file = Join-Path $TestDrive 'preflight.json'
+        $opts = Get-CheckerOptions -Bound ($inputOptions + @{OutputJson=$file})
+        Invoke-CheckerPreflight -SubId $sub -Options $opts -Catalog @() | Should -Be 0
+        $data = Get-Content $file -Raw | ConvertFrom-Json
+        $data.ExitCode | Should -Be 0
+        $data.Availability[0].Status | Should -Be 'SUPPORTED'
+        Should -Invoke Read-Host -Times 0 -Exactly
     }
 }

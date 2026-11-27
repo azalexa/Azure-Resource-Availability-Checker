@@ -1,0 +1,14 @@
+{
+  "Subscription": "Your subscription",
+  "Regions": [
+    "westeurope"
+  ],
+  "Resources": [
+    "Microsoft.Storage/storageAccounts",
+    "Microsoft.KeyVault/vaults"
+  ],
+  "CheckQuota": false,
+  "CheckPolicy": false,
+  "FailOnWarning": false,
+  "OutputJson": "azure-preflight-report.json"
+}

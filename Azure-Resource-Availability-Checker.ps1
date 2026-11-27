@@ -1,7 +1,7 @@
 ﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
-    Azure Resource Availability Checker v3.3. Interactive, read-only regional availability checker.
+    Azure Resource Availability Checker v3.4. Interactive, read-only regional availability checker.
 .DESCRIPTION
     Uses Azure CLI and the selected subscription. Does not register providers,
     deploy resources. Includes optional SKU, quota and policy screening checks. Defaults to all resource types
@@ -9,6 +9,25 @@
     checks and exports the last successful report only on request. Temporarily switches the local
     Azure CLI subscription and restores the previous selection on exit.
 #>
+[CmdletBinding()]
+param(
+    [switch]$NonInteractive,
+    [string]$Subscription,
+    [Alias('Region')][string[]]$Regions,
+    [string[]]$Resources,
+    [string]$SkuService,
+    [string]$SkuName,
+    [switch]$AppLinux,
+    [switch]$CheckQuota,
+    [string[]]$QuotaProviders,
+    [switch]$CheckPolicy,
+    [string]$ResourceGroup,
+    [switch]$FailOnWarning,
+    [string]$ConfigPath,
+    [string]$OutputJson
+)
+$checkerBound = @{} + $PSBoundParameters
+
 function Invoke-AzJson {
     param([string[]]$Arguments, [string]$CliPath)
     # Windows Azure CLI may resolve to a batch launcher. cmd.exe parses
@@ -176,16 +195,20 @@ function Show-CheckTable {
 }
 
 function Invoke-SkuCheck {
-    param([string]$SubId)
-    $regions = @(Select-AzureRegions $SubId)
+    param([string]$SubId, [object[]]$SelectedRegions, [string]$RequestedService, [string]$RequestedSku, [switch]$LinuxWorkers)
+    $regions = if ($SelectedRegions.Count) { @($SelectedRegions) } else { @(Select-AzureRegions $SubId) }
     $menu = @('Virtual Machine','Managed Disk','Storage Account','App Service Plan','SQL Database','PostgreSQL Flexible Server','MySQL Flexible Server' | ForEach-Object { [pscustomobject]@{Name=$_} })
-    $services = @(Select-Menu -Title 'SKU services' -Items $menu -Multiple)
+    $services = if ($RequestedService) { @($menu | Where-Object Name -eq $RequestedService) } else { @(Select-Menu -Title 'SKU services' -Items $menu -Multiple) }
+    if (-not $services) { throw 'Unknown SKU service.' }
     $appSku = $null; $appLinux = $false
-    if ('App Service Plan' -in $services.Name) {
+    if ($RequestedService) {
+        $appSku = $RequestedSku
+        $appLinux = $LinuxWorkers.IsPresent
+    } elseif ('App Service Plan' -in $services.Name) {
         do { $appSku = (Read-Host 'App Service SKU (e.g. B1, P1V3)').Trim().ToUpperInvariant() } until ($appSku -match '^[A-Z0-9]+$')
         $appLinux = ((Read-Host 'Linux workers? [y/N]').Trim() -eq 'Y')
     }
-    $filter = (Read-Host 'Filter SKU names (optional, Enter for all)').Trim()
+    $filter = if ($RequestedService) { $RequestedSku } else { (Read-Host 'Filter SKU names (optional, Enter for all)').Trim() }
     $storageCache = $null
     $results = @(foreach ($region in $regions) {
         foreach ($service in $services.Name) {
@@ -276,7 +299,7 @@ function Invoke-SkuCheck {
                 })
                 if (-not $rows.Count) { New-SkuRow $region $service '' '' 'NO_DATA' 'No SKU records returned.' $SubId }
                 else {
-                    $matched = @($rows | Where-Object { -not $filter -or $_.SKU.IndexOf($filter,[StringComparison]::OrdinalIgnoreCase) -ge 0 -or $_.Status -eq 'UNKNOWN' })
+                    $matched = @($rows | Where-Object { -not $filter -or ($RequestedService -and $_.SKU -eq $filter) -or (-not $RequestedService -and $_.SKU.IndexOf($filter,[StringComparison]::OrdinalIgnoreCase) -ge 0) -or $_.Status -eq 'UNKNOWN' })
                     if ($matched.Count) { $matched }
                     else { New-SkuRow $region $service $filter '' 'NO_DATA' 'No matching SKU in returned records; not a definitive deployment denial.' $SubId }
                 }
@@ -292,15 +315,16 @@ function Invoke-SkuCheck {
 }
 
 function Invoke-QuotaCheck {
-    param([string]$SubId)
-    $regions = @(Select-AzureRegions $SubId)
+    param([string]$SubId, [object[]]$SelectedRegions, [string[]]$RequestedProviders)
+    $regions = if ($SelectedRegions.Count) { @($SelectedRegions) } else { @(Select-AzureRegions $SubId) }
     $menu = @(
         [pscustomobject]@{Name='Compute (vCPU, VM families)'; Command=@('vm','list-usage')}
         [pscustomobject]@{Name='Network (public IPs, VNets, etc.)'; Command=@('network','list-usages')}
         [pscustomobject]@{Name='Storage (account counts)'; Command=@('storage','account','show-usage')}
         [pscustomobject]@{Name='SQL (regional subscription usage)'; Command=@('sql','list-usages')}
     )
-    $services = @(Select-Menu -Title 'Quota providers' -Items $menu -Multiple)
+    $services = if ($RequestedProviders.Count) { @($menu | Where-Object { ($_.Name -split ' ',2)[0] -in $RequestedProviders }) } else { @(Select-Menu -Title 'Quota providers' -Items $menu -Multiple) }
+    if (-not $services) { throw 'No quota providers selected.' }
     $results = @(foreach ($region in $regions) {
         foreach ($service in $services) {
             Write-Host "Checking $($service.Name) in $($region.DisplayName)..." -ForegroundColor Cyan
@@ -434,17 +458,17 @@ function New-PolicyRow {
 }
 
 function Invoke-PolicyCheck {
-    param([string]$SubId)
-    $regions = @(Select-AzureRegions $SubId)
+    param([string]$SubId, [object[]]$SelectedRegions, [string]$RequestedGroup, [string]$RequestedType)
+    $regions = if ($SelectedRegions.Count) { @($SelectedRegions) } else { @(Select-AzureRegions $SubId) }
     $targetScope = "/subscriptions/$SubId"
-    $group = (Read-Host 'Existing resource group name (Enter for subscription scope only)').Trim()
+    $group = if ($SelectedRegions.Count) { $RequestedGroup } else { (Read-Host 'Existing resource group name (Enter for subscription scope only)').Trim() }
     if ($group) {
         Assert-Subscription $SubId
         $rg = Invoke-AzJson @('group','show','--name',$group,'--subscription',$SubId)
         if (-not $rg.id) { throw 'Resource group could not be identified.' }
         $targetScope = $rg.id
     }
-    $targetType = (Read-Host 'Resource type (e.g. Microsoft.Storage/storageAccounts; Enter for location only)').Trim()
+    $targetType = if ($SelectedRegions.Count) { $RequestedType } else { (Read-Host 'Resource type (e.g. Microsoft.Storage/storageAccounts; Enter for location only)').Trim() }
     if ($targetType -and $targetType -notmatch '^[A-Za-z0-9.]+/[A-Za-z0-9._/-]+$') { throw 'Use a full ARM resource type, e.g. Microsoft.Storage/storageAccounts.' }
     Assert-Subscription $SubId
     Write-Host 'Reading applicable policy assignments and definitions...' -ForegroundColor Cyan
@@ -549,9 +573,10 @@ function Invoke-PolicyCheck {
 }
 
 function Invoke-AvailabilityCheck {
-    param([string]$SubId, [object[]]$Catalog)
+    param([string]$SubId, [object[]]$Catalog, [object[]]$SelectedRegions, [object[]]$SelectedResources)
 
-    $chosenRegions = @(Select-AzureRegions $SubId)
+    $chosenRegions = if ($SelectedRegions.Count) { @($SelectedRegions) } else { @(Select-AzureRegions $SubId) }
+    if ($SelectedResources.Count) { $mode = 'EXPLICIT' } else {
 
     Write-Host "`n=== Report scope ===" -ForegroundColor Cyan
     Write-Host '[Enter] All Azure resource types (default)'
@@ -565,6 +590,7 @@ function Invoke-AvailabilityCheck {
         if ($mode -eq 'Q') { throw [System.OperationCanceledException]::new('Cancelled by user.') }
         if ($mode -notin @('', 'C', 'S', 'P', 'F')) { Write-Host 'Invalid selection.' -ForegroundColor Yellow }
     } until ($mode -in @('', 'C', 'S', 'P', 'F'))
+    }
 
     $cache = @{}
     $typeIndex = @{}
@@ -585,7 +611,9 @@ function Invoke-AvailabilityCheck {
     }
     if ($typeIndex.Count -eq 0) { throw 'Azure returned no resource type metadata.' }
 
-    if ($mode -eq 'C') {
+    if ($mode -eq 'EXPLICIT') {
+        $chosenResources = @($SelectedResources)
+    } elseif ($mode -eq 'C') {
         $chosenResources = @($catalog)
     } elseif ($mode -eq 'S') {
         $chosenResources = @(Select-Menu -Title 'Resource types' -Items $catalog -Multiple)
@@ -704,21 +732,152 @@ function Export-CheckerReport {
     return $path
 }
 
+# Automation mode is intentionally explicit: no menu or Read-Host calls.
+function Get-CheckerOptions {
+    param([System.Collections.IDictionary]$Bound)
+    $keys = @('Subscription','Regions','Resources','SkuService','SkuName','AppLinux','CheckQuota','QuotaProviders','CheckPolicy','ResourceGroup','FailOnWarning','OutputJson')
+    $boolKeys = @('AppLinux','CheckQuota','CheckPolicy','FailOnWarning')
+    $arrayKeys = @('Regions','Resources','QuotaProviders')
+    $opts = @{}
+    foreach ($key in $keys) { $opts[$key] = $null }
+    if ($Bound['ConfigPath']) {
+        foreach ($key in $keys) { if ($Bound.Contains($key)) { throw 'Use either ConfigPath or explicit options, not both.' } }
+        $config = Get-Content -LiteralPath $Bound['ConfigPath'] -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        if ($config -isnot [pscustomobject]) { throw 'Configuration must be a JSON object.' }
+        foreach ($prop in $config.PSObject.Properties) {
+            if ($prop.Name -notin $keys) { throw "Unknown config field: $($prop.Name)" }
+            if ($prop.Name -in $boolKeys -and $prop.Value -isnot [bool]) { throw "$($prop.Name) must be a JSON boolean." }
+            if ($prop.Name -in $arrayKeys -and $prop.Value -isnot [array]) { throw "$($prop.Name) must be a JSON string array." }
+            if ($prop.Name -notin ($boolKeys + $arrayKeys) -and $prop.Value -isnot [string]) { throw "$($prop.Name) must be a JSON string." }
+            $opts[$prop.Name] = $prop.Value
+        }
+    } else {
+        foreach ($key in $keys) { if ($Bound.Contains($key)) { $opts[$key] = $Bound[$key] } }
+    }
+    if (-not $opts.Subscription -or -not @($opts.Regions | Where-Object { $_ }).Count -or -not @($opts.Resources | Where-Object { $_ }).Count) { throw 'Subscription, Regions and Resources are required in non-interactive mode.' }
+    foreach ($key in $arrayKeys) {
+        foreach ($value in @($opts[$key] | Where-Object { $null -ne $_ })) {
+            if ($value -isnot [string] -or -not $value.Trim()) { throw "$key must contain nonempty strings." }
+        }
+        $opts[$key] = @($opts[$key] | Where-Object { $_ } | ForEach-Object { $_.Trim() } | Select-Object -Unique)
+    }
+    foreach ($value in $opts.Resources) { if ($value -notmatch '^[A-Za-z0-9.]+/[A-Za-z0-9._/-]+$') { throw "Invalid full ARM resource type: $value" } }
+    foreach ($value in $opts.Regions) { if ($value -notmatch '^[A-Za-z0-9 ]+$') { throw "Invalid region: $value" } }
+    if ([bool]$opts.SkuService -ne [bool]$opts.SkuName) { throw 'SkuService and SkuName must be provided together.' }
+    if ($opts.SkuService -and $opts.SkuService -notin @('Virtual Machine','Managed Disk','Storage Account','App Service Plan','SQL Database','PostgreSQL Flexible Server','MySQL Flexible Server')) { throw 'Unsupported SKU service.' }
+    if ($opts.SkuName -and $opts.SkuName -notmatch '^[A-Za-z0-9._ -]+$') { throw 'Invalid SKU name.' }
+    if ($opts.SkuService -eq 'App Service Plan' -and $opts.SkuName -notmatch '^[A-Za-z0-9]+$') { throw 'Invalid App Service SKU.' }
+    if ($opts.AppLinux -and $opts.SkuService -ne 'App Service Plan') { throw 'AppLinux requires App Service Plan.' }
+    if ($opts.QuotaProviders.Count -and -not $opts.CheckQuota) { throw 'QuotaProviders requires CheckQuota.' }
+    if ($opts.CheckQuota -and -not $opts.QuotaProviders.Count) { $opts.QuotaProviders = @('Compute','Network','Storage','SQL') }
+    foreach ($value in $opts.QuotaProviders) { if ($value -notin @('Compute','Network','Storage','SQL')) { throw "Unsupported quota provider: $value" } }
+    if ($opts.ResourceGroup -and (-not $opts.CheckPolicy -or $opts.ResourceGroup -notmatch '^[\p{L}\p{N}_.()-]+$' -or $opts.ResourceGroup -match '[()]')) { throw 'ResourceGroup requires CheckPolicy and a group name without parentheses in automation mode.' }
+    return $opts
+}
+
+function Resolve-CheckerRegions {
+    param([string]$SubId, [string[]]$Requested)
+    Assert-Subscription $SubId
+    $available = @(Invoke-AzJson @('account','list-locations') | Where-Object {
+        ($_.metadata.regionType -eq 'Physical' -or (-not $_.metadata.regionType -and $_.type -eq 'Region')) -and (-not $_.type -or $_.type -eq 'Region')
+    })
+    $chosen = @{}
+    foreach ($name in $Requested) {
+        $normalized = Normalize-Location $name
+        $matches = @($available | Where-Object { (Normalize-Location $_.name) -eq $normalized -or (Normalize-Location $_.displayName) -eq $normalized })
+        if ($matches.Count -ne 1) { throw "Region not uniquely found in subscription: $name" }
+        $r = $matches[0]
+        if (-not $chosen.ContainsKey($r.name)) {
+            $chosen[$r.name] = $true
+            [pscustomobject]@{Name=$r.name;DisplayName=$r.displayName;RegionalDisplayName=$r.regionalDisplayName}
+        }
+    }
+}
+
+function Get-PreflightDecision {
+    param([object[]]$Availability, [object[]]$Sku, [object[]]$Quota, [object[]]$Policy, [switch]$ExpectSku, [switch]$ExpectQuota, [switch]$ExpectPolicy, [switch]$Strict)
+    $findings = @(foreach ($kind in @('availability','sku','quota','policy')) {
+        $rows = switch ($kind) { 'availability' { $Availability } 'sku' { $Sku } 'quota' { $Quota } 'policy' { $Policy } }
+        $expected = $kind -eq 'availability' -or ($kind -eq 'sku' -and $ExpectSku) -or ($kind -eq 'quota' -and $ExpectQuota) -or ($kind -eq 'policy' -and $ExpectPolicy)
+        if (-not @($rows | Where-Object { $_ }).Count -and $expected) { [pscustomobject]@{Check=$kind;Region='';Subject='';Severity='ERROR';Reason='No report rows returned.'} }
+        foreach ($row in @($rows | Where-Object { $_ })) {
+            $severity = ''; $reason = [string]$row.Status
+            if ($row.Status -in @('ERROR','NO_DATA','UNKNOWN','RESTRICTION_UNKNOWN')) { $severity = 'ERROR' }
+            elseif ($kind -eq 'availability') {
+                if ($row.Status -eq 'NOT_SUPPORTED') { $severity = 'BLOCK' }
+                elseif ($row.Status -ne 'SUPPORTED') { $severity = 'ERROR' }
+                if ($row.Registration -eq 'NotRegistered' -and -not $severity) { $severity='BLOCK'; $reason='Provider not registered.' }
+                elseif ($row.Registration -ne 'Registered' -and -not $severity) { $severity='ERROR'; $reason='Provider registration not confirmed.' }
+            } elseif ($kind -eq 'sku') {
+                if ($row.Status -in @('RESTRICTED','NOT_LISTED')) { $severity='BLOCK' }
+                elseif ($row.Status -eq 'ZONE_RESTRICTED') { $severity='WARNING' }
+                elseif ($row.Status -ne 'LISTED') { $severity='ERROR' }
+            } elseif ($kind -eq 'quota') {
+                if ($row.Status -in @('NEAR_LIMIT','EXHAUSTED')) { $severity='WARNING'; $reason += ' (deployment demand not supplied)' }
+                elseif ($row.Status -ne 'HEADROOM') { $severity='ERROR' }
+            } elseif ($kind -eq 'policy') {
+                if ($row.Status -eq 'POTENTIAL_DENY') { $severity='BLOCK' }
+                elseif ($row.Status -in @('REVIEW','NO_ASSIGNMENTS','AUDIT')) { $severity='WARNING' }
+                elseif ($row.Status -notin @('NO_MATCH','NOT_ENFORCED','DISABLED','SCOPE_EXCLUDED')) { $severity='ERROR' }
+            }
+            if ($severity) {
+                $subject = switch ($kind) { 'availability' { "$($row.Provider)/$($row.ResourceType)" } 'sku' { "$($row.Service): $($row.SKU)" } 'quota' { "$($row.Service): $($row.Quota)" } 'policy' { [string]$row.Assignment } }
+                [pscustomobject]@{Check=$kind;Region=$row.Region;Subject=$subject;Severity=$severity;Reason=$reason}
+            }
+        }
+    })
+    $code = if (@($findings | Where-Object Severity -eq 'ERROR').Count) { 2 } elseif (@($findings | Where-Object Severity -eq 'BLOCK').Count -or ($Strict -and @($findings | Where-Object Severity -eq 'WARNING').Count)) { 1 } else { 0 }
+    [pscustomobject]@{ExitCode=$code;Findings=$findings}
+}
+
+function Invoke-CheckerPreflight {
+    param([string]$SubId, [hashtable]$Options, [object[]]$Catalog)
+    $selected = @(Resolve-CheckerRegions -SubId $SubId -Requested $Options.Regions)
+    if (-not $selected.Count) { throw 'No regions resolved.' }
+    $requested = @(foreach ($key in $Options.Resources) {
+        $parts = $key -split '/',2
+        $friendly = @($Catalog | Where-Object { $_.Provider -eq $parts[0] -and $_.Type -eq $parts[1] })
+        $name = if ($friendly.Count) { $friendly[0].Name } else { $key }
+        New-Resource $name $parts[0] $parts[1]
+    })
+    $availability = @(Invoke-AvailabilityCheck -SubId $SubId -Catalog $Catalog -SelectedRegions $selected -SelectedResources $requested)
+    $sku = @(); $quota = @(); $policy = @()
+    if ($Options.SkuService) { $sku = @(Invoke-SkuCheck -SubId $SubId -SelectedRegions $selected -RequestedService $Options.SkuService -RequestedSku $Options.SkuName -LinuxWorkers:([bool]$Options.AppLinux)) }
+    if ($Options.CheckQuota) { $quota = @(Invoke-QuotaCheck -SubId $SubId -SelectedRegions $selected -RequestedProviders $Options.QuotaProviders) }
+    if ($Options.CheckPolicy) {
+        $policy = @(foreach ($r in $requested) { Invoke-PolicyCheck -SubId $SubId -SelectedRegions $selected -RequestedGroup $Options.ResourceGroup -RequestedType "$($r.Provider)/$($r.Type)" })
+    }
+    $decision = Get-PreflightDecision -Availability $availability -Sku $sku -Quota $quota -Policy $policy -ExpectSku:([bool]$Options.SkuService) -ExpectQuota:([bool]$Options.CheckQuota) -ExpectPolicy:([bool]$Options.CheckPolicy) -Strict:([bool]$Options.FailOnWarning)
+    $report = [pscustomobject]@{Version='3.4';GeneratedUtc=[DateTime]::UtcNow.ToString('o');SubscriptionId=$SubId;ExitCode=$decision.ExitCode;Findings=@($decision.Findings);Availability=$availability;Sku=$sku;Quota=$quota;Policy=$policy}
+    if ($Options.OutputJson) { ConvertTo-Json -InputObject $report -Depth 30 | Set-Content -LiteralPath $Options.OutputJson -Encoding UTF8 -ErrorAction Stop }
+    if ($decision.Findings.Count) { $decision.Findings | Format-Table Check,Region,Severity,Subject,Reason -Wrap -AutoSize | Out-Host }
+    Write-Host "Preflight exit code: $($decision.ExitCode). Metadata screening only; no deployment guarantee."
+    return $decision.ExitCode
+}
+
 # Loading functions for Pester must not start an interactive Azure session.
 if ($MyInvocation.InvocationName -eq '.') { return }
 $ErrorActionPreference = 'Stop'
 
 $previousSubId = $null
 $restoreSubscription = $false
+$exitCode = 0
+$automation = $NonInteractive -or [bool]$ConfigPath
 
 try {
-    Write-Host 'AZURE RESOURCE AVAILABILITY CHECKER v3.3' -ForegroundColor Cyan
+    if ($automation) { $options = Get-CheckerOptions -Bound $checkerBound }
+    elseif (@($checkerBound.Keys | Where-Object { $_ -in @('Subscription','Regions','Resources','SkuService','SkuName','AppLinux','CheckQuota','QuotaProviders','CheckPolicy','ResourceGroup','FailOnWarning','OutputJson') }).Count) { throw 'Use NonInteractive when supplying automation options.' }
+    Write-Host 'AZURE RESOURCE AVAILABILITY CHECKER v3.4' -ForegroundColor Cyan
     if (-not (Get-Command az -ErrorAction SilentlyContinue)) { throw 'Azure CLI not found. Install it first.' }
     $subscriptions = @(Invoke-AzJson @('account','list') | Where-Object { $_.state -eq 'Enabled' } | Sort-Object name | ForEach-Object {
-        [pscustomobject]@{ Name = "$($_.name) ($($_.id))"; Id = $_.id }
+        [pscustomobject]@{ Name = "$($_.name) ($($_.id))"; AccountName = $_.name; Id = $_.id }
     })
     if ($subscriptions.Count -eq 0) { throw 'No enabled subscription found. Run az login first.' }
-    $subscription = Select-Menu -Title 'Subscription' -Items $subscriptions
+    if ($automation) {
+        $matches = @($subscriptions | Where-Object { $_.Id -eq $options.Subscription -or $_.AccountName -eq $options.Subscription })
+        if ($matches.Count -ne 1) { throw 'Subscription not uniquely found; use its ID.' }
+        $subscription = $matches[0]
+    } else { $subscription = Select-Menu -Title 'Subscription' -Items $subscriptions }
     $subId = $subscription.Id
 
     $previousSubId = (Invoke-AzJson @('account','show')).id
@@ -731,6 +890,8 @@ try {
     $activeSubId = (Invoke-AzJson @('account','show')).id
     if ($activeSubId -ne $subId) { throw 'Active Azure CLI subscription does not match the selection.' }
 
+    if ($automation) { $exitCode = Invoke-CheckerPreflight -SubId $subId -Options $options -Catalog $catalog }
+    else {
     # Run the first check directly. Subsequent checks and exports are independent menu actions.
     $lastResults = @()
     $lastReportType = 'availability'
@@ -791,11 +952,13 @@ try {
             if ($action -notin @('N','K','U','P','E','Q')) { Write-Host 'Invalid selection. Try again.' -ForegroundColor Yellow }
         } until ($action -in @('N','K','U','P','E','Q'))
     }
+    }
 } catch [System.OperationCanceledException] {
     Write-Host 'Cancelled.'
+    if ($automation) { $exitCode = 2 }
 } catch {
     Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
-    exit 1
+    $exitCode = if ($automation) { 2 } else { 1 }
 } finally {
     if ($restoreSubscription -and $previousSubId) {
         try {
@@ -804,6 +967,9 @@ try {
             Write-Host 'Previous Azure CLI subscription restored.' -ForegroundColor Gray
         } catch {
             Write-Warning "Could not restore previous subscription. Run: az account set --subscription $previousSubId"
+            if ($automation) { $exitCode = 2 }
         }
     }
 }
+
+if ($automation -or $exitCode -ne 0) { exit $exitCode }

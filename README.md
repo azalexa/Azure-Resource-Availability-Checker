@@ -2,11 +2,13 @@
 
 An interactive PowerShell utility that checks Azure Resource Manager resource type availability across Azure regions before infrastructure deployment. It uses Azure CLI metadata from the selected subscription and does not provision or modify Azure resources.
 
-**Current version: 3.3**
+**Current version: 3.4**
 
 [![CI](https://github.com/azalexa/Azure-Resource-Availability-Checker/actions/workflows/ci.yml/badge.svg)](https://github.com/azalexa/Azure-Resource-Availability-Checker/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/azalexa/Azure-Resource-Availability-Checker)](https://github.com/azalexa/Azure-Resource-Availability-Checker/releases) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 ## Features
+
+- Non-interactive preflight mode for CI/CD with explicit inputs, JSON configuration, exit codes and optional structured JSON reports.
 
 - Interactive selection of an enabled Azure subscription.
 - Dynamic geography groups and region discovery, including numbered regions such as East US 2.
@@ -160,7 +162,44 @@ The test suite uses Pester mocks for Azure metadata and a local fake CLI launche
 
 Dot-sourcing the main script loads its functions for tests without starting the interactive session. Normal users should execute the script with `&` or directly by path, not dot-source it.
 
+
+## Non-interactive mode (v3.4)
+
+The existing interactive menu is unchanged. For automation, authenticate Azure CLI first and invoke the script in a separate PowerShell process. Supply a subscription name or ID, one or more region names/codes and one or more full ARM resource types. The mode never prompts for selections.
+
+```powershell
+./Azure-Resource-Availability-Checker.ps1 -NonInteractive `
+    -Subscription 'Your subscription' -Regions 'westeurope','eastus2' `
+    -Resources 'Microsoft.Storage/storageAccounts','Microsoft.KeyVault/vaults' `
+    -OutputJson './azure-preflight-report.json'
+$code = $LASTEXITCODE
+if ($code -ne 0) { exit $code }
+```
+
+Optional switches: `-SkuService` and `-SkuName` together (one exact SKU and service per invocation; `-AppLinux` for App Service), `-CheckQuota` with optional `-QuotaProviders Compute,Network,Storage,SQL` (defaults to all four), `-CheckPolicy` with optional `-ResourceGroup` (existing group, or subscription scope only), and `-FailOnWarning`. Policy screening runs per requested resource type; the SKU is a separate explicit check and is not inferred from resource types. Quota is advisory because deployment demand is not supplied. Names are not a substitute for resource kind, tier or actual capacity validation. Region matching is exact after normalization.
+
+Alternatively, copy [examples/preflight.example.json](examples/preflight.example.json), replace the placeholder subscription, and run:
+
+```powershell
+./Azure-Resource-Availability-Checker.ps1 -ConfigPath ./examples/preflight.example.json
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+```
+
+Configuration uses the named parameters as JSON keys, string arrays for Regions/Resources/QuotaProviders, and true/false for switches. ConfigPath and explicit options cannot be combined (except NonInteractive). The example output file name is ignored by Git. Do not publish reports or private configs containing subscription IDs. JSON report output is optional and written only after checks return; early failures may produce no file. Use a fresh file path for each run and always inspect the process exit code.
+
+| Exit code | Meaning |
+| --- | --- |
+| 0 | No blocking or inconclusive checks; warnings may remain. Not a deployment approval. |
+| 1 | Regional support missing, provider not registered, SKU restriction/not listed, potential policy denial, or warnings in strict mode. |
+| 2 | Invalid configuration, CLI/metadata error, missing/unknown required results, unconfirmed registration or subscription restoration failure. Takes precedence over 1. |
+
+GLOBAL is inconclusive for a regional deployment and returns 2. Quota NEAR_LIMIT/EXHAUSTED, zone restrictions, audit and policy review/no assignments are warnings; `-FailOnWarning` makes these return 1. Quota errors/unknown data return 2. The gate is deliberately conservative; use specific resources rather than the full catalog. A green result is **not** a guarantee of deployability. Policy exemptions, overrides and conditions may require manual review. The caller must authenticate the CLI, arrange permissions, and stop deployment on nonzero codes. No Azure deployment, policy enforcement or provider registration is performed.
+
+For a pipeline, authenticate using its supported Azure identity mechanism (prefer workload identity federation) before this step; do not commit credentials. The existing Pester CI remains offline and uses mocks. No live Azure pipeline has been configured by this update.
+
 ## Version history
+
+- **3.4:** Non-interactive preflight mode, JSON configuration and reports, gate exit codes.
 
 - **3.3:** Pester regression tests, cross-platform GitHub Actions CI, test reports and README badges.
 
