@@ -37,7 +37,7 @@ jobs:
             artifact: ubuntu-ps7
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install dependencies (PowerShell 5.1)
         if: matrix.shell == 'powershell'
@@ -66,8 +66,9 @@ jobs:
 
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: test-results-${{ matrix.artifact }}
           path: TestResults.xml
           if-no-files-found: warn
+
