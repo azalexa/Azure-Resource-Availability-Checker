@@ -1,0 +1,7 @@
+# Generated reports may contain subscription identifiers.
+azure-availability-*.csv
+*.log
+.env
+.env.*
+.vscode/
+.azure/
