@@ -1,5 +1,20 @@
 # Changelog
 
+## 3.2.1
+
+- Fix Windows `az.cmd` / `az.bat` argument passing for the `atScope()` filter in both policy assignment and exemption queries.
+- Preserve unmodified filter arguments for native executables and non-Windows launchers.
+
+## 3.2
+
+- Add optional Azure Policy screening from the main menu (`P`).
+- Read applicable and inherited assignments at subscription or selected resource group scope, expand initiatives and resolve simple parameters.
+- Screen location and resource type conditions with conservative, three-valued logic.
+- Flag potential Deny effects, audit effects, disabled or non-enforced assignments, exclusions and uncertainty.
+- Attempt exemption discovery and flag unhandled selectors, overrides and version constraints.
+- Allow optional CSV export of the policy report; preserve previous report if all new rows fail.
+- Keep checks read-only; no full deployment or policy simulation.
+
 ## 3.1
 
 - Add optional regional quota and usage reports for Compute, Network, Storage and SQL.

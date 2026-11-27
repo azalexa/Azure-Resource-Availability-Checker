@@ -2,7 +2,7 @@
 
 An interactive PowerShell utility that checks Azure Resource Manager resource type availability across Azure regions before infrastructure deployment. It uses Azure CLI metadata from the selected subscription and does not provision or modify Azure resources.
 
-**Current version: 3.1**
+**Current version: 3.2.1**
 
 ## Features
 
@@ -16,6 +16,7 @@ An interactive PowerShell utility that checks Azure Resource Manager resource ty
 - Search resource names, provider namespaces and resource types.
 - Optional SKU checks for seven service categories, with restriction metadata where available.
 - Optional regional usage and quota checks for Compute, Network, Storage and SQL.
+- Optional Azure Policy screening for a selected scope, region and resource type.
 - Optional CSV export of the last successful report, only when requested.
 
 ## Requirements
@@ -46,7 +47,7 @@ Unblock-File .\Azure-Resource-Availability-Checker.ps1
 3. Choose one or more Azure regions. Enter `0` to select all listed choices.
 4. Press Enter to check all returned Azure resource types, or choose a narrower report scope.
 5. Review the regional availability tables and region comparison.
-6. Press Enter or `N` to run another check, `K` for SKU, `U` for quota, `E` to export the last successful report, or `Q` to quit.
+6. Press Enter or `N` to run another check, `K` for SKU, `U` for quota, `P` for Azure Policy, `E` to export the last successful report, or `Q` to quit.
 
 ### Report scope
 
@@ -107,20 +108,44 @@ Choose one or more regions and quota providers. The report includes used, limit,
 
 `HEADROOM` means usage is below 80% of a positive limit; `NEAR_LIMIT` means 80% or more but below the limit; `EXHAUSTED` means used is at least the limit (including a zero limit). Negative, missing or unparseable usage/limit values are `UNKNOWN`. Remaining is clamped at zero. A deployment may require more capacity than the reported headroom; VM family and total regional vCPU quotas both matter. These are provider-specific usage metrics, not a complete quota inventory. Some subscriptions may lack permissions or expose no usage metrics.
 
+## Azure Policy screening (P)
+
+Choose one or more regions, then optionally enter an existing resource group name and a full ARM resource type (for example `Microsoft.Storage/storageAccounts`). Leave the resource group blank to inspect subscription-level and inherited assignments only; resource-group and resource-level assignments are not included in that mode. Leave the type blank for a location-only screen. The resource group is a scope, not the region of a proposed resource.
+
+The checker lists applicable assignments using `az policy assignment list --scope ... --filter atScope()`, retrieves definitions (including initiative members) using read-only ARM GET requests, resolves simple parameter references and evaluates a subset of policy conditions. It also attempts to list visible exemptions. Definition lookups are cached for the current check. Exact definition versions are requested when available; unresolved version constraints are flagged. No policy is assigned, modified, deleted or evaluated by the Azure Policy service.
+
+| Status | Meaning |
+| --- | --- |
+| POTENTIAL_DENY | The fetched rule has a Deny effect and its supported condition evaluates true for the supplied fields. This is a warning, not proof of a deployment block. |
+| REVIEW | Effect or applicability is uncertain, or the rule needs further review (for example tags, SKU, aliases, resource selectors or unresolved expressions). |
+| AUDIT | A fetched audit effect is present and the supported condition is true or unknown. |
+| NO_MATCH | The supported condition evaluates false for supplied fields and the fetched rule. This is not deployment approval. |
+| NOT_ENFORCED | The assignment reports DoNotEnforce. |
+| DISABLED | The fetched effect is Disabled and no unresolved override/version was detected. |
+| SCOPE_EXCLUDED | The selected scope is covered by a reported assignment exclusion. |
+| NO_ASSIGNMENTS | No applicable assignments were returned at the requested scope. This does not prove that no policy can affect deployment. |
+| ERROR | A definition or initiative member could not be retrieved or processed. |
+
+Only `location` and `type` with `equals`, `notEquals`, `in`, `notIn`, and Boolean combinations (`allOf`, `anyOf`, `not`) are screened. Unsupported fields, functions and expressions become unknown; policy expressions are never executed. Indexed mode applicability, exact resource IDs, tags, full aliases, resource payloads, initiative overrides, selectors, exemptions and wildcard version resolution are not fully evaluated. Review the actual policy in Azure Portal or use deployment validation before relying on any result. The CSV contains assignment IDs, scope, effect, condition result and explanatory caveats. Permissions to read assignments, definitions and exemptions are required for complete metadata visibility.
+
+References: [Azure CLI policy assignments](https://learn.microsoft.com/cli/azure/policy/assignment), [assignment structure](https://learn.microsoft.com/azure/governance/policy/concepts/assignment-structure), [policy applicability](https://learn.microsoft.com/azure/governance/policy/concepts/policy-applicability).
+
 ## CSV export
 
-Choose `E` from the main menu to export the last successful report to the current directory. The report includes the columns for its type (availability, SKU or quota), details and subscription ID. Failed or empty SKU/quota checks do not replace the previous report; partial results can include error rows. It is not a cumulative history. CSV delimiters follow the system locale.
+Choose `E` from the main menu to export the last successful report to the current directory. The report includes the columns for its type (availability, SKU, quota or policy), details and subscription ID. Failed or empty SKU/quota/policy checks do not replace the previous report; partial results can include error rows. It is not a cumulative history. CSV delimiters follow the system locale.
 
 **Do not publish generated reports containing subscription IDs or other private account information.** The `.gitignore` excludes the generated report filenames.
 
 ## Limitations and safety
 
-This is a metadata checker, not a guarantee of deployability. The default regional report does not validate SKU, kind or quota. The optional SKU and quota reports cover selected services only. None of the reports validate actual capacity, Azure Policy, deployment permissions or every service-specific constraint. Child resource types may inherit a parent location and return no location metadata. The full report can be large. Provider registration state and resource availability are separate checks.
+This is a metadata checker, not a guarantee of deployability. The default regional report does not validate SKU, kind or quota. The optional SKU and quota reports cover selected services only. The optional policy report is a partial metadata screen, not full Azure Policy evaluation. None of the reports validate actual capacity, deployment permissions or every service-specific constraint. Child resource types may inherit a parent location and return no location metadata. The full report can be large. Provider registration state and resource availability are separate checks.
 
 The script does not deploy resources or register providers. It temporarily changes the locally selected Azure CLI subscription when necessary and attempts to restore the previous subscription on exit. Avoid running another process that changes the same CLI context concurrently.
 
 ## Version history
 
+- **3.2.1:** Fix Windows Azure CLI batch-launcher quoting for policy assignment and exemption filters.
+- **3.2:** Azure Policy assignment, initiative and partial location/type screening with optional CSV.
 - **3.1:** Regional quota and usage checks; optional CSV for the latest report type.
 - **3.0:** Resource search and SKU metadata checks.
 - **2.3:** Repeat checks and explicitly requested CSV exports.
