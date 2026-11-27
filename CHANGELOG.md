@@ -1,5 +1,13 @@
 # Changelog
 
+## 3.3
+
+- Add Pester regression tests for region availability, SKU restrictions, quota boundaries, policy conditions, menus, CSV and CLI errors.
+- Exercise native command argument handling with a local fake Azure CLI launcher.
+- Add GitHub Actions CI for Windows PowerShell 5.1, PowerShell 7 on Windows and PowerShell 7 on Ubuntu, including syntax and analyzer checks.
+- Make function loading and CSV export testable without starting an Azure session.
+- Add CI, release and license badges to the README.
+
 ## 3.2.1
 
 - Fix Windows `az.cmd` / `az.bat` argument passing for the `atScope()` filter in both policy assignment and exemption queries.

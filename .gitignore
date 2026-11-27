@@ -5,3 +5,6 @@ azure-availability-*.csv
 .env.*
 .vscode/
 .azure/
+
+# Local CI test output
+TestResults.xml

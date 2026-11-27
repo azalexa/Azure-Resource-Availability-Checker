@@ -1,7 +1,7 @@
 ﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
-    Azure Resource Availability Checker v3.2.1. Interactive, read-only regional availability checker.
+    Azure Resource Availability Checker v3.3. Interactive, read-only regional availability checker.
 .DESCRIPTION
     Uses Azure CLI and the selected subscription. Does not register providers,
     deploy resources. Includes optional SKU, quota and policy screening checks. Defaults to all resource types
@@ -9,15 +9,13 @@
     checks and exports the last successful report only on request. Temporarily switches the local
     Azure CLI subscription and restores the previous selection on exit.
 #>
-$ErrorActionPreference = 'Stop'
-
 function Invoke-AzJson {
-    param([string[]]$Arguments)
+    param([string[]]$Arguments, [string]$CliPath)
     # Windows Azure CLI may resolve to a batch launcher. cmd.exe parses
     # unquoted parentheses again; preserve literal quotes for that launcher.
-    $azCommand = Get-Command az -ErrorAction Stop
+    if (-not $CliPath) { $CliPath = (Get-Command az -CommandType Application -ErrorAction Stop | Select-Object -First 1).Path }
     $cliArguments = @($Arguments)
-    if ($azCommand.Path -match '\.(cmd|bat)$') {
+    if ($CliPath -match '\.(cmd|bat)$') {
         # PowerShell 7 uses legacy native argument passing for batch files.
         # Set it locally even if the caller has chosen Standard mode.
         $PSNativeCommandArgumentPassing = 'Legacy'
@@ -27,10 +25,10 @@ function Invoke-AzJson {
             }
         }
     }
-    $raw = & az @cliArguments --only-show-errors --output json
+    $raw = & $CliPath @cliArguments --only-show-errors --output json
     if ($LASTEXITCODE -ne 0) { throw "Azure CLI command failed: az $($Arguments -join ' ')" }
     if (-not $raw) { throw 'Azure CLI returned no data.' }
-    ($raw -join "`n") | ConvertFrom-Json
+    ($raw -join "`n") | ConvertFrom-Json -ErrorAction Stop
 }
 
 function Select-Menu {
@@ -697,11 +695,24 @@ function Invoke-AvailabilityCheck {
     return $results
 }
 
+function Export-CheckerReport {
+    param([object[]]$Rows, [string]$ReportType, [string]$Directory = (Get-Location).Path)
+    if (-not $Rows.Count) { throw 'No successful report to export.' }
+    if ($ReportType -notin @('availability','sku','quota','policy')) { throw 'Invalid report type.' }
+    $path = Join-Path $Directory ('azure-availability-{0}-{1}.csv' -f $ReportType,(Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
+    $Rows | Export-Csv -LiteralPath $path -NoTypeInformation -Encoding UTF8 -UseCulture -ErrorAction Stop
+    return $path
+}
+
+# Loading functions for Pester must not start an interactive Azure session.
+if ($MyInvocation.InvocationName -eq '.') { return }
+$ErrorActionPreference = 'Stop'
+
 $previousSubId = $null
 $restoreSubscription = $false
 
 try {
-    Write-Host 'AZURE RESOURCE AVAILABILITY CHECKER v3.2.1' -ForegroundColor Cyan
+    Write-Host 'AZURE RESOURCE AVAILABILITY CHECKER v3.3' -ForegroundColor Cyan
     if (-not (Get-Command az -ErrorAction SilentlyContinue)) { throw 'Azure CLI not found. Install it first.' }
     $subscriptions = @(Invoke-AzJson @('account','list') | Where-Object { $_.state -eq 'Enabled' } | Sort-Object name | ForEach-Object {
         [pscustomobject]@{ Name = "$($_.name) ($($_.id))"; Id = $_.id }
@@ -753,8 +764,7 @@ try {
                 Write-Host 'No successful report to export. Run a check first.' -ForegroundColor Yellow
             } else {
                 try {
-                    $path = Join-Path (Get-Location).Path ('azure-availability-{0}-{1}.csv' -f $lastReportType,(Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
-                    $lastResults | Export-Csv -LiteralPath $path -NoTypeInformation -Encoding UTF8 -UseCulture
+                    $path = Export-CheckerReport -Rows $lastResults -ReportType $lastReportType
                     Write-Host "Saved: $path" -ForegroundColor Green
                 } catch {
                     Write-Host "Export failed: $($_.Exception.Message)" -ForegroundColor Red

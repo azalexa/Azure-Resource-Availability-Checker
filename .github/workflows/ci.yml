@@ -1,0 +1,48 @@
+name: PowerShell CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows PowerShell 5.1
+            os: windows-latest
+            shell: powershell
+            artifact: windows-ps51
+          - name: Windows PowerShell 7
+            os: windows-latest
+            shell: pwsh
+            artifact: windows-ps7
+          - name: Ubuntu PowerShell 7
+            os: ubuntu-latest
+            shell: pwsh
+            artifact: ubuntu-ps7
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test dependencies
+        shell: ${{ matrix.shell }}
+        run: |
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          Install-Module Pester -RequiredVersion 5.7.1 -Scope CurrentUser -Force -SkipPublisherCheck -Repository PSGallery
+          Install-Module PSScriptAnalyzer -RequiredVersion 1.24.0 -Scope CurrentUser -Force -Repository PSGallery
+      - name: Run syntax, analyzer and unit tests
+        shell: ${{ matrix.shell }}
+        run: ./tests/Invoke-CI.ps1
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.artifact }}
+          path: TestResults.xml
+          if-no-files-found: warn

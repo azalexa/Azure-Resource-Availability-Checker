@@ -2,7 +2,9 @@
 
 An interactive PowerShell utility that checks Azure Resource Manager resource type availability across Azure regions before infrastructure deployment. It uses Azure CLI metadata from the selected subscription and does not provision or modify Azure resources.
 
-**Current version: 3.2.1**
+**Current version: 3.3**
+
+[![CI](https://github.com/azalexa/Azure-Resource-Availability-Checker/actions/workflows/ci.yml/badge.svg)](https://github.com/azalexa/Azure-Resource-Availability-Checker/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/azalexa/Azure-Resource-Availability-Checker)](https://github.com/azalexa/Azure-Resource-Availability-Checker/releases) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 ## Features
 
@@ -142,7 +144,25 @@ This is a metadata checker, not a guarantee of deployability. The default region
 
 The script does not deploy resources or register providers. It temporarily changes the locally selected Azure CLI subscription when necessary and attempts to restore the previous subscription on exit. Avoid running another process that changes the same CLI context concurrently.
 
+## Development and testing
+
+GitHub Actions runs syntax validation, PSScriptAnalyzer and Pester on Windows PowerShell 5.1, PowerShell 7 on Windows, and PowerShell 7 on Ubuntu for pushes to `main`, pull requests targeting `main`, and manual runs. No Azure credentials are required. Analyzer errors fail CI; warnings are reported for review. Test reports are uploaded even on failure.
+
+Run the same checks locally from the repository root:
+
+```powershell
+Install-Module Pester -RequiredVersion 5.7.1 -Scope CurrentUser -Force -SkipPublisherCheck
+Install-Module PSScriptAnalyzer -RequiredVersion 1.24.0 -Scope CurrentUser -Force
+.\tests\Invoke-CI.ps1
+```
+
+The test suite uses Pester mocks for Azure metadata and a local fake CLI launcher to exercise argument passing and error handling. It covers selected region, SKU, quota, policy, menu and export scenarios. The mocks are never used in normal execution. This is not full end-to-end Azure validation: manually verify provider-specific API behavior on an authorized test subscription before releasing changes.
+
+Dot-sourcing the main script loads its functions for tests without starting the interactive session. Normal users should execute the script with `&` or directly by path, not dot-source it.
+
 ## Version history
+
+- **3.3:** Pester regression tests, cross-platform GitHub Actions CI, test reports and README badges.
 
 - **3.2.1:** Fix Windows Azure CLI batch-launcher quoting for policy assignment and exemption filters.
 - **3.2:** Azure Policy assignment, initiative and partial location/type screening with optional CSV.
